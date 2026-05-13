@@ -1,5 +1,7 @@
 #include "render_task.hpp"
 
+#include <string>
+
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -26,6 +28,8 @@ void render_task_entry(void* arg)
     }
 
     int last_expression = -1;
+    std::uint32_t last_balloon_version = 0;
+    std::string balloon_scratch;
     for (;;) {
         const int expr = args.state->expression.load(std::memory_order_relaxed);
         if (expr != last_expression) {
@@ -33,6 +37,17 @@ void render_task_entry(void* arg)
             last_expression = expr;
         }
         avatar.set_mouth_open(args.state->mouth_open.load(std::memory_order_relaxed));
+
+        const std::uint32_t balloon_version = args.state->balloon_version();
+        if (balloon_version != last_balloon_version) {
+            if (args.state->balloon_visible()) {
+                args.state->copy_balloon_text(balloon_scratch);
+                avatar.set_balloon_text(balloon_scratch);
+            } else {
+                avatar.clear_balloon();
+            }
+            last_balloon_version = balloon_version;
+        }
 
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
         avatar.tick(now_ms);

@@ -14,11 +14,13 @@ struct Palette {
 };
 
 inline constexpr Palette kDefaultPalette{
-    .primary = 0xFFFFu,            // white
-    .background = 0x0000u,         // black
-    .secondary = 0xFFE0u,          // yellow
-    .balloon_foreground = 0xFFFFu, // white
-    .balloon_background = 0x0000u, // black
+    .primary = 0xFFFFu,            // white  (avatar face)
+    .background = 0x0000u,         // black  (canvas background)
+    .secondary = 0xFFE0u,          // yellow (accent)
+    // Balloon uses inverted colours so it stands out against the dark face:
+    // a solid white panel with black text.
+    .balloon_foreground = 0x0000u, // black  (text)
+    .balloon_background = 0xFFFFu, // white  (panel fill)
 };
 
 } // namespace stackchan::avatar

@@ -2,6 +2,19 @@
 
 namespace stackchan::avatar::internal {
 
+namespace {
+
+// Geometry of the bottom-of-screen balloon (canvas is 320x240).
+constexpr std::int16_t kMargin = 4;
+constexpr std::int16_t kPanelH = 40;
+constexpr std::int16_t kPanelX = kMargin;
+constexpr std::int16_t kPanelY = 240 - kPanelH - kMargin;
+constexpr std::int16_t kPanelW = 320 - kMargin * 2;
+constexpr std::int16_t kPanelRadius = 10;
+constexpr std::uint8_t kTextSize = 3; // 18 x 24 per glyph
+
+} // namespace
+
 void draw_balloon(M5Canvas& canvas, const DrawContext& ctx)
 {
     if (!ctx.balloon_text.has_value()) {
@@ -13,27 +26,17 @@ void draw_balloon(M5Canvas& canvas, const DrawContext& ctx)
     }
 
     const std::uint16_t fg = ctx.palette.balloon_foreground;
+    const std::uint16_t bg = ctx.palette.balloon_background;
 
-    constexpr std::int16_t cx = 240;
-    constexpr std::int16_t cy = 220;
-    constexpr std::int16_t char_w = 6;
-    constexpr std::int16_t char_h = 9;
+    canvas.fillRoundRect(kPanelX, kPanelY, kPanelW, kPanelH, kPanelRadius, bg);
+    canvas.drawRoundRect(kPanelX, kPanelY, kPanelW, kPanelH, kPanelRadius, fg);
 
-    const std::int16_t text_w = static_cast<std::int16_t>(text.size()) * char_w;
-    const std::int16_t outer_w = text_w + 12;
-    const std::int16_t outer_h = char_h * 2 + 2;
-
-    // Ellipse outline (M5GFX has drawEllipse(cx, cy, rx, ry, color))
-    canvas.drawEllipse(cx - 20, cy, outer_w / 2, outer_h / 2, fg);
-    // Tail (simple triangle outline drawn with 3 lines).
-    canvas.drawLine(cx - 62, cy - 42, cx - 8, cy - 10, fg);
-    canvas.drawLine(cx - 8, cy - 10, cx - 41, cy - 8, fg);
-    canvas.drawLine(cx - 41, cy - 8, cx - 62, cy - 42, fg);
-
-    canvas.setTextColor(fg);
-    canvas.setTextSize(1);
-    canvas.setCursor(static_cast<std::int16_t>(cx - text_w / 2 - 20), static_cast<std::int16_t>(cy - char_h / 2));
-    canvas.print(text.c_str());
+    canvas.setTextColor(fg, bg);
+    canvas.setTextSize(kTextSize);
+    canvas.setTextDatum(lgfx::textdatum_t::middle_center);
+    canvas.drawString(text.c_str(),
+                      kPanelX + kPanelW / 2,
+                      kPanelY + kPanelH / 2);
 }
 
 } // namespace stackchan::avatar::internal

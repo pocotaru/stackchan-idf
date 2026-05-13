@@ -43,6 +43,11 @@ void demo_loop()
     constexpr std::uint32_t kSpeechMinMs = 6000;
     constexpr std::uint32_t kSpeechMaxMs = 12000;
 
+    static constexpr const char* kPhrases[] = {
+        "Hello!", "Hi there", "How are you?", "I'm listening", "Tell me more",
+        "Interesting", "Beep boop", "Nice to meet you", "Stack-chan here",
+    };
+
     static app::Speech speech;
 
     auto rand_in = [](float low, float high) {
@@ -57,6 +62,7 @@ void demo_loop()
     std::uint32_t next_expression_ms = 0;
     std::uint32_t next_pose_ms = 0;
     std::uint32_t next_speech_ms = 2000; // first babble shortly after boot
+    bool balloon_up = false;
 
     for (;;) {
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
@@ -64,8 +70,17 @@ void demo_loop()
         // Mouth opens with the current speech envelope; closed while silent.
         g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
 
+        // Drop the balloon when the speech ends.
+        if (balloon_up && !speech.is_speaking()) {
+            g_state->clear_balloon();
+            balloon_up = false;
+        }
+
         if (now_ms >= next_speech_ms && !speech.is_speaking()) {
             speech.babble(now_ms);
+            constexpr std::size_t kPhraseCount = sizeof(kPhrases) / sizeof(kPhrases[0]);
+            g_state->set_balloon_text(kPhrases[esp_random() % kPhraseCount]);
+            balloon_up = true;
             next_speech_ms = now_ms + rand_range_ms(kSpeechMinMs, kSpeechMaxMs);
         }
 
