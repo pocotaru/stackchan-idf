@@ -13,6 +13,7 @@
 #include "render_task.hpp"
 #include "servo_task.hpp"
 #include "shared_state.hpp"
+#include "speech.hpp"
 
 namespace {
 
@@ -39,6 +40,10 @@ void demo_loop()
     constexpr std::uint32_t kPoseMinMs = 10000;
     constexpr std::uint32_t kPoseMaxMs = 20000;
     constexpr std::uint32_t kExpressionPeriodMs = 5000;
+    constexpr std::uint32_t kSpeechMinMs = 6000;
+    constexpr std::uint32_t kSpeechMaxMs = 12000;
+
+    static app::Speech speech;
 
     auto rand_in = [](float low, float high) {
         const float u = static_cast<float>(esp_random()) / static_cast<float>(UINT32_MAX);
@@ -51,15 +56,18 @@ void demo_loop()
     std::size_t expression_index = 0;
     std::uint32_t next_expression_ms = 0;
     std::uint32_t next_pose_ms = 0;
+    std::uint32_t next_speech_ms = 2000; // first babble shortly after boot
 
     for (;;) {
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
 
-        // Mouth: smooth bobble at ~0.5 Hz drives only the avatar, not a servo,
-        // so it's safe to update continuously.
-        const float t = static_cast<float>(now_ms) / 1000.0f;
-        const float mouth = 0.5f + 0.5f * std::sin(t * 2.0f * 3.14159265f / 2.0f);
-        g_state->mouth_open.store(mouth, std::memory_order_relaxed);
+        // Mouth opens with the current speech envelope; closed while silent.
+        g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
+
+        if (now_ms >= next_speech_ms && !speech.is_speaking()) {
+            speech.babble(now_ms);
+            next_speech_ms = now_ms + rand_range_ms(kSpeechMinMs, kSpeechMaxMs);
+        }
 
         // Random yaw + pitch every 10–20 s.
         if (now_ms >= next_pose_ms) {

@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.cpp"
         "render_task.cpp"
         "servo_task.cpp"
+        "speech.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         board
