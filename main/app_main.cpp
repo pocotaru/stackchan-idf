@@ -3,6 +3,7 @@
 
 #include <M5Unified.h>
 #include <esp_log.h>
+#include <esp_random.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -30,15 +31,24 @@ void demo_loop()
         avatar::Expression::Neutral, avatar::Expression::Happy, avatar::Expression::Doubt,
         avatar::Expression::Sad,     avatar::Expression::Angry, avatar::Expression::Sleepy,
     };
-    // Discrete head targets — PathGenerator interpolates smoothly between them.
-    // (Continuously changing yaw_deg would restart begin_move_to every tick and
-    //  the servo would never make visible progress.)
-    constexpr float kYawTargets[] = {0.0f, 20.0f, 0.0f, -20.0f};
-    constexpr std::uint32_t kPosePeriodMs = 2000;
-    constexpr std::uint32_t kExpressionPeriodMs = 3000;
+
+    // Random head pose targets, redrawn every kPoseMinMs..kPoseMaxMs.
+    constexpr float kYawMaxDeg = 40.0f;          // ±40°
+    constexpr float kPitchMinDeg = -10.0f;       // little down
+    constexpr float kPitchMaxDeg =  25.0f;       // more up
+    constexpr std::uint32_t kPoseMinMs = 10000;
+    constexpr std::uint32_t kPoseMaxMs = 20000;
+    constexpr std::uint32_t kExpressionPeriodMs = 5000;
+
+    auto rand_in = [](float low, float high) {
+        const float u = static_cast<float>(esp_random()) / static_cast<float>(UINT32_MAX);
+        return low + (high - low) * u;
+    };
+    auto rand_range_ms = [](std::uint32_t low, std::uint32_t high) {
+        return low + (esp_random() % (high - low + 1));
+    };
 
     std::size_t expression_index = 0;
-    std::size_t pose_index = 0;
     std::uint32_t next_expression_ms = 0;
     std::uint32_t next_pose_ms = 0;
 
@@ -51,14 +61,14 @@ void demo_loop()
         const float mouth = 0.5f + 0.5f * std::sin(t * 2.0f * 3.14159265f / 2.0f);
         g_state->mouth_open.store(mouth, std::memory_order_relaxed);
 
-        // Step-wise yaw target every 2 s so the path generator can run.
+        // Random yaw + pitch every 10–20 s.
         if (now_ms >= next_pose_ms) {
-            g_state->target_yaw_deg.store(kYawTargets[pose_index], std::memory_order_relaxed);
-            pose_index = (pose_index + 1) % (sizeof(kYawTargets) / sizeof(kYawTargets[0]));
-            next_pose_ms = now_ms + kPosePeriodMs;
+            g_state->target_yaw_deg.store(rand_in(-kYawMaxDeg, kYawMaxDeg), std::memory_order_relaxed);
+            g_state->target_pitch_deg.store(rand_in(kPitchMinDeg, kPitchMaxDeg), std::memory_order_relaxed);
+            next_pose_ms = now_ms + rand_range_ms(kPoseMinMs, kPoseMaxMs);
         }
 
-        // Cycle expression every 3 s.
+        // Cycle expression every 5 s.
         if (now_ms >= next_expression_ms) {
             g_state->expression.store(static_cast<int>(kCycle[expression_index]), std::memory_order_relaxed);
             expression_index = (expression_index + 1) % (sizeof(kCycle) / sizeof(kCycle[0]));
