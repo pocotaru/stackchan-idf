@@ -40,14 +40,16 @@ tl::expected<void, ScsError> ScsServo::enable_torque(bool on)
 tl::expected<void, ScsError>
 ScsServo::write_goal_position(std::uint16_t raw, std::uint16_t time_ms, std::uint16_t speed)
 {
+    // SCSCL series uses big-endian wire format (high byte first) for multi-byte
+    // register values. See FTServo_Arduino SCS::Host2SCS with End=1.
     const std::array<std::uint8_t, 7> params{
         kRegGoalPositionLow,
-        static_cast<std::uint8_t>(raw & 0xFF),
         static_cast<std::uint8_t>((raw >> 8) & 0xFF),
-        static_cast<std::uint8_t>(time_ms & 0xFF),
+        static_cast<std::uint8_t>(raw & 0xFF),
         static_cast<std::uint8_t>((time_ms >> 8) & 0xFF),
-        static_cast<std::uint8_t>(speed & 0xFF),
+        static_cast<std::uint8_t>(time_ms & 0xFF),
         static_cast<std::uint8_t>((speed >> 8) & 0xFF),
+        static_cast<std::uint8_t>(speed & 0xFF),
     };
     std::array<std::uint8_t, 4> scratch{};
     auto r = bus_.transact(id_, kInstWrite, params, scratch);
@@ -68,7 +70,8 @@ tl::expected<std::uint16_t, ScsError> ScsServo::read_present_position()
     if (r->size() < 2) {
         return tl::unexpected{ScsError::BadLength};
     }
-    return static_cast<std::uint16_t>((*r)[0] | (static_cast<std::uint16_t>((*r)[1]) << 8));
+    // Big-endian response: high byte first.
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>((*r)[0]) << 8) | (*r)[1]);
 }
 
 } // namespace stackchan::scs_servo
