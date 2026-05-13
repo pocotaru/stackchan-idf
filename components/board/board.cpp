@@ -23,7 +23,7 @@ private:
     Py32Expander expander_;
 };
 
-std::expected<Board, Error> Board::begin()
+tl::expected<Board, Error> Board::begin()
 {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -31,7 +31,7 @@ std::expected<Board, Error> Board::begin()
 
     // PY32 can take up to ~1.2 s to come up after a cold reset. Match the
     // BSP's polling pattern: try once every 200 ms for ~1.2 s.
-    std::expected<Py32Expander, Error> expander = std::unexpected{Error::ExpanderProbe};
+    tl::expected<Py32Expander, Error> expander = tl::unexpected{Error::ExpanderProbe};
     for (int attempt = 0; attempt < 6; ++attempt) {
         vTaskDelay(pdMS_TO_TICKS(200));
         expander = Py32Expander::probe();
@@ -41,17 +41,17 @@ std::expected<Board, Error> Board::begin()
     }
     if (!expander) {
         ESP_LOGE(kTag, "PY32 IO expander probe failed at 0x%02X", Py32Expander::kAddress);
-        return std::unexpected{expander.error()};
+        return tl::unexpected{expander.error()};
     }
 
     if (auto r = expander->set_direction(Py32Expander::kPinServoPowerEnable, /*output=*/true); !r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     if (auto r = expander->set_pull_up(Py32Expander::kPinServoPowerEnable, true); !r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     if (auto r = expander->digital_write(Py32Expander::kPinServoPowerEnable, false); !r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
 
     Board board;
@@ -65,7 +65,7 @@ M5GFX& Board::display() noexcept
     return M5.Display;
 }
 
-std::expected<void, Error> Board::set_servo_power(bool on)
+tl::expected<void, Error> Board::set_servo_power(bool on)
 {
     return impl_->expander().digital_write(Py32Expander::kPinServoPowerEnable, on);
 }

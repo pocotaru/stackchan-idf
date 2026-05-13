@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <span>
 
 #include <driver/gpio.h>
@@ -21,7 +21,7 @@ public:
         std::uint32_t timeout_ms = 20;
     };
 
-    static std::expected<ScsBus, ScsError> create(const Config& config);
+    static tl::expected<ScsBus, ScsError> create(const Config& config);
 
     ScsBus(const ScsBus&) = delete;
     ScsBus& operator=(const ScsBus&) = delete;
@@ -32,12 +32,12 @@ public:
     // Send a request and receive the status packet. `params` is the payload that
     // follows the Instruction byte. `rx_scratch` is the caller-supplied buffer
     // for the response data field; the returned span aliases it.
-    std::expected<std::span<const std::uint8_t>, ScsError>
+    tl::expected<std::span<const std::uint8_t>, ScsError>
     transact(std::uint8_t id, std::uint8_t instruction, std::span<const std::uint8_t> params,
              std::span<std::uint8_t> rx_scratch);
 
     // Send-only (for broadcast ID 0xFE or sync writes).
-    std::expected<void, ScsError>
+    tl::expected<void, ScsError>
     send(std::uint8_t id, std::uint8_t instruction, std::span<const std::uint8_t> params);
 
     uart_port_t uart() const noexcept { return uart_; }

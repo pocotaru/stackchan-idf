@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 
 #include "scs_servo/scs_bus.hpp"
 #include "scs_servo/scs_error.hpp"
@@ -36,11 +36,11 @@ class ScsServo {
 public:
     ScsServo(ScsBus& bus, std::uint8_t id) noexcept : bus_{bus}, id_{id} {}
 
-    std::expected<void, ScsError> ping();
-    std::expected<void, ScsError> enable_torque(bool on);
-    std::expected<void, ScsError> write_goal_position(std::uint16_t raw, std::uint16_t time_ms,
+    tl::expected<void, ScsError> ping();
+    tl::expected<void, ScsError> enable_torque(bool on);
+    tl::expected<void, ScsError> write_goal_position(std::uint16_t raw, std::uint16_t time_ms,
                                                      std::uint16_t speed);
-    std::expected<std::uint16_t, ScsError> read_present_position();
+    tl::expected<std::uint16_t, ScsError> read_present_position();
 
     std::uint8_t id() const noexcept { return id_; }
 

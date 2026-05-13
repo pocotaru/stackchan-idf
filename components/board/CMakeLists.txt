@@ -7,8 +7,8 @@ idf_component_register(
     REQUIRES
         M5Unified
         M5GFX
+        tl_expected
     PRIV_REQUIRES
-        esp_driver_i2c
-        esp_driver_gpio
+        driver
 )
-target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_23)
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)

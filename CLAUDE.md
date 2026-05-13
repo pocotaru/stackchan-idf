@@ -1,27 +1,29 @@
 # stackchan-idf
 
-M5Stack CoreS3 向けスタックチャン ファームウェア (ESP-IDF 6.0 / C++23)。
+M5Stack CoreS3 向けスタックチャン ファームウェア (ESP-IDF 5.4 / C++20)。
 
 ## ビルド
 
 ```sh
 git submodule update --init --recursive
-tools/apply-m5-patches.sh                 # IDF 6 / CoreS3 patches を当てる
+tools/apply-m5-patches.sh                 # M5Unified の 1 行修正を当てる
 idf.py set-target esp32s3
 idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-`components/M5Unified` / `components/M5GFX` は upstream `master` を指す
-submodule。IDF 6.0 / CoreS3 で動作させるため、[patches/](patches/) の
-ローカルパッチを [tools/apply-m5-patches.sh](tools/apply-m5-patches.sh) で
-適用する (再 sync 手順含めて [M5_IDF6_PATCHES.md](M5_IDF6_PATCHES.md) を参照)。
+`components/M5Unified` / `components/M5GFX` / `components/tl_expected/expected`
+は upstream を指す submodule。M5Unified `RTC_PowerHub_Class::setAlarmIRQ` の
+`buf` 初期化未指定が GCC `-Werror=maybe-uninitialized` に引っかかるため、
+[patches/m5unified.patch](patches/m5unified.patch) を
+[tools/apply-m5-patches.sh](tools/apply-m5-patches.sh) で適用する。
 
 ## コーディング規約
 
-- 言語: **C++23**。各コンポーネントの `CMakeLists.txt` で
-  `target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_23)` を必ず宣言。
-- **エラー伝搬は `std::expected`**。例外は使わない。
+- 言語: **C++20**。各コンポーネントの `CMakeLists.txt` で
+  `target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)` を必ず宣言。
+- **エラー伝搬は `tl::expected`** ([components/tl_expected/expected](components/tl_expected/expected)、
+  `#include <tl/expected.hpp>`)。例外は使わない。C++20 では `std::expected` が無いので backport を使用。
 - 値の有無は `std::optional`。
 - **非 null の参照渡しはポインタではなく `T&`**。
 - 所有は `std::unique_ptr` / `std::shared_ptr`。生ポインタは非所有 view のみ。

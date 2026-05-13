@@ -14,4 +14,4 @@ idf_component_register(
         M5GFX
         M5Unified
 )
-target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_23)
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)

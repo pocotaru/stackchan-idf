@@ -26,7 +26,6 @@ void render_task_entry(void* arg)
     }
 
     int last_expression = -1;
-    TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         const int expr = args.state->expression.load(std::memory_order_relaxed);
         if (expr != last_expression) {
@@ -38,7 +37,9 @@ void render_task_entry(void* arg)
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
         avatar.tick(now_ms);
 
-        vTaskDelayUntil(&last_wake, kPeriodTicks);
+        // Use vTaskDelay (not vTaskDelayUntil) so the IDLE task on this core
+        // always gets at least one tick, even if a frame ran long.
+        vTaskDelay(kPeriodTicks);
     }
 }
 

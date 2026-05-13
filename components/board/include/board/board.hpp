@@ -1,6 +1,6 @@
 #pragma once
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 
 #include <M5GFX.h>
@@ -16,7 +16,7 @@ enum class Error {
 
 class Board {
 public:
-    static std::expected<Board, Error> begin();
+    static tl::expected<Board, Error> begin();
 
     Board(Board&&) noexcept = default;
     Board& operator=(Board&&) noexcept = default;
@@ -26,7 +26,7 @@ public:
 
     M5GFX& display() noexcept;
 
-    std::expected<void, Error> set_servo_power(bool on);
+    tl::expected<void, Error> set_servo_power(bool on);
 
 private:
     Board() = default;

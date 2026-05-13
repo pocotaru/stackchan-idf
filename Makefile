@@ -1,4 +1,4 @@
-IDF_PATH    ?= $(HOME)/esp-idf/6.0
+IDF_PATH    ?= $(HOME)/esp-idf/5.4.2
 IDF_EXPORTS  = $(IDF_PATH)/export.sh
 TARGET      ?= esp32s3
 

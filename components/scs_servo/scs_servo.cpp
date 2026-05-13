@@ -16,28 +16,28 @@ constexpr std::uint8_t kRegPresentPositionLow = 0x38;
 
 } // namespace
 
-std::expected<void, ScsError> ScsServo::ping()
+tl::expected<void, ScsError> ScsServo::ping()
 {
     std::array<std::uint8_t, 4> scratch{};
     auto r = bus_.transact(id_, kInstPing, {}, scratch);
     if (!r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     return {};
 }
 
-std::expected<void, ScsError> ScsServo::enable_torque(bool on)
+tl::expected<void, ScsError> ScsServo::enable_torque(bool on)
 {
     const std::array<std::uint8_t, 2> params{kRegTorqueEnable, static_cast<std::uint8_t>(on ? 1 : 0)};
     std::array<std::uint8_t, 4> scratch{};
     auto r = bus_.transact(id_, kInstWrite, params, scratch);
     if (!r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     return {};
 }
 
-std::expected<void, ScsError>
+tl::expected<void, ScsError>
 ScsServo::write_goal_position(std::uint16_t raw, std::uint16_t time_ms, std::uint16_t speed)
 {
     const std::array<std::uint8_t, 7> params{
@@ -52,21 +52,21 @@ ScsServo::write_goal_position(std::uint16_t raw, std::uint16_t time_ms, std::uin
     std::array<std::uint8_t, 4> scratch{};
     auto r = bus_.transact(id_, kInstWrite, params, scratch);
     if (!r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     return {};
 }
 
-std::expected<std::uint16_t, ScsError> ScsServo::read_present_position()
+tl::expected<std::uint16_t, ScsError> ScsServo::read_present_position()
 {
     const std::array<std::uint8_t, 2> params{kRegPresentPositionLow, 2};
     std::array<std::uint8_t, 4> scratch{};
     auto r = bus_.transact(id_, kInstRead, params, scratch);
     if (!r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
     if (r->size() < 2) {
-        return std::unexpected{ScsError::BadLength};
+        return tl::unexpected{ScsError::BadLength};
     }
     return static_cast<std::uint16_t>((*r)[0] | (static_cast<std::uint16_t>((*r)[1]) << 8));
 }

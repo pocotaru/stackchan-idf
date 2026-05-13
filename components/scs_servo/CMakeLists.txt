@@ -3,9 +3,10 @@ idf_component_register(
         "scs_bus.cpp"
         "scs_servo.cpp"
     INCLUDE_DIRS "include"
+    REQUIRES
+        tl_expected
     PRIV_REQUIRES
-        esp_driver_uart
-        esp_driver_gpio
+        driver
         esp_timer
 )
-target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_23)
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)

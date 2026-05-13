@@ -30,7 +30,7 @@ std::uint8_t make_checksum(std::span<const std::uint8_t> bytes) noexcept
 
 } // namespace
 
-std::expected<ScsBus, ScsError> ScsBus::create(const Config& config)
+tl::expected<ScsBus, ScsError> ScsBus::create(const Config& config)
 {
     const uart_config_t uart_config = {
         .baud_rate = static_cast<int>(config.baud),
@@ -44,15 +44,15 @@ std::expected<ScsBus, ScsError> ScsBus::create(const Config& config)
     };
 
     if (uart_driver_install(config.uart, kRxBufferBytes, 0, 0, nullptr, 0) != ESP_OK) {
-        return std::unexpected{ScsError::UartInit};
+        return tl::unexpected{ScsError::UartInit};
     }
     if (uart_param_config(config.uart, &uart_config) != ESP_OK) {
         uart_driver_delete(config.uart);
-        return std::unexpected{ScsError::UartInit};
+        return tl::unexpected{ScsError::UartInit};
     }
     if (uart_set_pin(config.uart, config.tx, config.rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
         uart_driver_delete(config.uart);
-        return std::unexpected{ScsError::UartInit};
+        return tl::unexpected{ScsError::UartInit};
     }
 
     ScsBus bus;
@@ -91,11 +91,11 @@ void ScsBus::release() noexcept
     }
 }
 
-std::expected<void, ScsError>
+tl::expected<void, ScsError>
 ScsBus::send(std::uint8_t id, std::uint8_t instruction, std::span<const std::uint8_t> params)
 {
     if (params.size() > kMaxParams) {
-        return std::unexpected{ScsError::BufferTooSmall};
+        return tl::unexpected{ScsError::BufferTooSmall};
     }
 
     std::array<std::uint8_t, kMaxParams + 6> tx{};
@@ -111,20 +111,20 @@ ScsBus::send(std::uint8_t id, std::uint8_t instruction, std::span<const std::uin
     uart_flush_input(uart_);
     const int written = uart_write_bytes(uart_, tx.data(), total);
     if (written < 0 || static_cast<std::size_t>(written) != total) {
-        return std::unexpected{ScsError::UartInit};
+        return tl::unexpected{ScsError::UartInit};
     }
     if (uart_wait_tx_done(uart_, pdMS_TO_TICKS(timeout_ms_)) != ESP_OK) {
-        return std::unexpected{ScsError::Timeout};
+        return tl::unexpected{ScsError::Timeout};
     }
     return {};
 }
 
-std::expected<std::span<const std::uint8_t>, ScsError>
+tl::expected<std::span<const std::uint8_t>, ScsError>
 ScsBus::transact(std::uint8_t id, std::uint8_t instruction, std::span<const std::uint8_t> params,
                  std::span<std::uint8_t> rx_scratch)
 {
     if (auto r = send(id, instruction, params); !r) {
-        return std::unexpected{r.error()};
+        return tl::unexpected{r.error()};
     }
 
     // Receive header: 0xFF 0xFF | ID | Length
@@ -133,45 +133,45 @@ ScsBus::transact(std::uint8_t id, std::uint8_t instruction, std::span<const std:
 
     int n = uart_read_bytes(uart_, header.data(), header.size(), ticks);
     if (n != static_cast<int>(header.size())) {
-        return std::unexpected{ScsError::Timeout};
+        return tl::unexpected{ScsError::Timeout};
     }
     if (header[0] != 0xFF || header[1] != 0xFF) {
-        return std::unexpected{ScsError::BadHeader};
+        return tl::unexpected{ScsError::BadHeader};
     }
     if (header[2] != id) {
-        return std::unexpected{ScsError::IdMismatch};
+        return tl::unexpected{ScsError::IdMismatch};
     }
 
     const std::uint8_t length = header[3];
     if (length < 2) {
-        return std::unexpected{ScsError::BadLength};
+        return tl::unexpected{ScsError::BadLength};
     }
     const std::size_t body_len = length - 1; // error + params + checksum, minus checksum below
     if (body_len < 1) {
-        return std::unexpected{ScsError::BadLength};
+        return tl::unexpected{ScsError::BadLength};
     }
     const std::size_t data_len = body_len - 1; // subtract the error byte
     if (data_len > rx_scratch.size()) {
-        return std::unexpected{ScsError::BufferTooSmall};
+        return tl::unexpected{ScsError::BufferTooSmall};
     }
 
     std::array<std::uint8_t, 1> err_byte{};
     n = uart_read_bytes(uart_, err_byte.data(), err_byte.size(), ticks);
     if (n != 1) {
-        return std::unexpected{ScsError::Timeout};
+        return tl::unexpected{ScsError::Timeout};
     }
 
     if (data_len > 0) {
         n = uart_read_bytes(uart_, rx_scratch.data(), data_len, ticks);
         if (n != static_cast<int>(data_len)) {
-            return std::unexpected{ScsError::Timeout};
+            return tl::unexpected{ScsError::Timeout};
         }
     }
 
     std::array<std::uint8_t, 1> cks_byte{};
     n = uart_read_bytes(uart_, cks_byte.data(), 1, ticks);
     if (n != 1) {
-        return std::unexpected{ScsError::Timeout};
+        return tl::unexpected{ScsError::Timeout};
     }
 
     // Verify checksum over ID, Length, Error, Params.
@@ -181,12 +181,12 @@ ScsBus::transact(std::uint8_t id, std::uint8_t instruction, std::span<const std:
     }
     const std::uint8_t expected = static_cast<std::uint8_t>(~sum);
     if (expected != cks_byte[0]) {
-        return std::unexpected{ScsError::ChecksumMismatch};
+        return tl::unexpected{ScsError::ChecksumMismatch};
     }
 
     if ((err_byte[0] & kStatusErrorMask) != 0) {
         ESP_LOGW(kTag, "servo id=%u reports error=0x%02X", id, err_byte[0]);
-        return std::unexpected{ScsError::ServoError};
+        return tl::unexpected{ScsError::ServoError};
     }
 
     return std::span<const std::uint8_t>{rx_scratch.data(), data_len};

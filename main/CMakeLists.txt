@@ -11,7 +11,6 @@ idf_component_register(
         M5Unified
         M5GFX
         esp_timer
-        esp_driver_uart
-        esp_driver_gpio
+        driver
 )
-target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_23)
+target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)
