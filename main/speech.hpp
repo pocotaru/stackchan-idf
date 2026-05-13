@@ -22,6 +22,10 @@ public:
     // `seed` randomises pitch / syllable count so successive calls differ.
     void babble(std::uint32_t seed);
 
+    // Cancel any in-flight babble so we can hand the speaker / I2S bus to
+    // someone else (e.g. mic loopback). After this is_speaking() returns false.
+    void stop();
+
     // 0..1 envelope at "now". Returns 0 if nothing is playing.
     float current_mouth_open() const;
 

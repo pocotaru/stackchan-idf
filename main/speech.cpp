@@ -133,6 +133,15 @@ void Speech::babble(std::uint32_t seed)
                        /*stop_current_sound=*/true);
 }
 
+void Speech::stop()
+{
+    if (M5.Speaker.isPlaying()) {
+        M5.Speaker.stop();
+    }
+    start_ms_.store(0, std::memory_order_release);
+    duration_ms_.store(0, std::memory_order_release);
+}
+
 bool Speech::is_speaking() const
 {
     const std::uint32_t start = start_ms_.load(std::memory_order_acquire);

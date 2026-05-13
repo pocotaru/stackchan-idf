@@ -25,6 +25,42 @@ stackchan::app::SharedState* g_state = nullptr;
 stackchan::app::RenderTaskArgs* g_render_args = nullptr;
 stackchan::app::ServoTaskArgs* g_servo_args = nullptr;
 
+// CoreS3 mic + speaker share I2S_NUM_1, so we have to hand the bus around
+// explicitly. Records `seconds` of audio at 16 kHz then plays it straight
+// back. Blocks the caller for ~2 * seconds.
+void record_and_playback(std::uint32_t seconds, const char* label)
+{
+    constexpr std::uint32_t kSampleRate = 16'000;
+    std::vector<std::int16_t> buf(kSampleRate * seconds, 0);
+
+    while (M5.Speaker.isPlaying()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    M5.Speaker.end();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    ESP_LOGI(kTag, "%s: recording %u s...", label, static_cast<unsigned>(seconds));
+    if (!M5.Mic.record(buf.data(), buf.size(), kSampleRate, /*stereo=*/false)) {
+        ESP_LOGE(kTag, "M5.Mic.record returned false");
+        return;
+    }
+    for (int i = 0; i < 50 && M5.Mic.isRecording() == 0; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    while (M5.Mic.isRecording()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    M5.Mic.end();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    ESP_LOGI(kTag, "%s: playing back...", label);
+    M5.Speaker.playRaw(buf.data(), buf.size(), kSampleRate, /*stereo=*/false);
+    while (M5.Speaker.isPlaying()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGI(kTag, "%s: done", label);
+}
+
 void demo_loop()
 {
     using namespace stackchan;
@@ -81,10 +117,28 @@ void demo_loop()
     static std::atomic<bool> balloon_in_flight{false};
 
     for (;;) {
+        // Drive M5.update() so M5.Touch / M5.BtnPWR latch their state machines.
+        M5.update();
+
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
 
         // Mouth opens with the current speech envelope; closed while silent.
         g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
+
+        // Tap-to-record: any single-finger click cancels current babble and
+        // runs one 2-second record + playback. Blocks demo_loop for ~4 s but
+        // the render task keeps animating.
+        if (M5.Touch.getDetail(0).wasClicked()) {
+            speech.stop();
+            g_state->set_balloon_text("Recording...", /*hold_ms=*/UINT32_MAX);
+            record_and_playback(2, "tap");
+            g_state->clear_balloon();
+            // Skip the random babble briefly so the user can hear the
+            // playback without it being interrupted by a babble kicking in.
+            next_speech_ms = now_ms + 1500;
+            balloon_in_flight.store(false, std::memory_order_release);
+            continue;
+        }
 
         // Kick off a new babble + balloon once the previous balloon is done
         // (callback resets balloon_in_flight) AND audio is idle AND the random
@@ -150,37 +204,8 @@ extern "C" void app_main()
     M5.Speaker.end();
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    // Mic / loopback sanity check: record 2 s, then play it back so we can
-    // hear whether the on-board mic + ES7210 codec are wired up.
-    {
-        constexpr std::uint32_t kSampleRate = 16'000;
-        constexpr std::uint32_t kSeconds = 2;
-        constexpr std::size_t kSamples = kSampleRate * kSeconds;
-        std::vector<std::int16_t> buf(kSamples, 0);
-
-        ESP_LOGI(kTag, "mic test: recording %u s...", static_cast<unsigned>(kSeconds));
-        if (!M5.Mic.record(buf.data(), buf.size(), kSampleRate, /*stereo=*/false)) {
-            ESP_LOGE(kTag, "M5.Mic.record returned false");
-        } else {
-            // record() is async — the mic task hasn't necessarily flipped
-            // _is_recording yet. Spin a few ticks until it has, then wait
-            // for it to drop back to 0.
-            for (int i = 0; i < 50 && M5.Mic.isRecording() == 0; ++i) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-            while (M5.Mic.isRecording()) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            M5.Mic.end();
-            vTaskDelay(pdMS_TO_TICKS(20));
-            ESP_LOGI(kTag, "mic test: playing back...");
-            M5.Speaker.playRaw(buf.data(), buf.size(), kSampleRate, /*stereo=*/false);
-            while (M5.Speaker.isPlaying()) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-            }
-            ESP_LOGI(kTag, "mic test: done");
-        }
-    }
+    // Mic / loopback sanity check at startup.
+    record_and_playback(2, "mic test");
 
     if (auto r = board.set_servo_power(true); !r) {
         ESP_LOGE(kTag, "set_servo_power(true) failed: %d", static_cast<int>(r.error()));
