@@ -207,7 +207,7 @@ private:
         cfg.tools.push_back(make_set_head_pose_tool());
         config_ = cfg;
 
-        local_ = Local::Init;
+        set_local(Local::Init);
         auto r = client_->start(config_);
         if (!r) {
             ESP_LOGE(kTag, "client start failed: %d", static_cast<int>(r.error()));
@@ -236,6 +236,15 @@ private:
     }
 
     // ---- per-state servicing ----------------------------------------------
+
+    // Single point of truth for the local state — also publishes "idle" so
+    // demo_loop knows when it may run its idle behaviours (head poses,
+    // nadenade) without fighting an in-progress reply.
+    void set_local(Local s)
+    {
+        local_ = s;
+        state_.conversation_idle.store(s == Local::Listening, std::memory_order_relaxed);
+    }
 
     void service_state()
     {
@@ -335,7 +344,7 @@ private:
         M5.Mic.record(mic_buf_[0].data(), mic_buf_[0].size(), kMicSampleRate, /*stereo=*/false);
         M5.Mic.record(mic_buf_[1].data(), mic_buf_[1].size(), kMicSampleRate, /*stereo=*/false);
         mic_read_ = 0;
-        local_ = Local::Listening;
+        set_local(Local::Listening);
     }
 
     // Switch the I2S bus to the speaker and begin streaming playback. Called
@@ -348,7 +357,7 @@ private:
         seg_pos_ = 0;
         seg_next_ = 0;
         playback_start_ms_ = now_ms();
-        local_ = Local::Speaking;
+        set_local(Local::Speaking);
         ESP_LOGI(kTag, "speaking (streaming)");
     }
 
@@ -393,7 +402,6 @@ private:
                 state_.conversation_active.store(true, std::memory_order_relaxed);
                 enter_listening();
             }
-            state_.conversation_state.store(static_cast<int>(ev.state), std::memory_order_relaxed);
             break;
 
         case conv::ConversationEventType::SpeechStarted:
@@ -403,7 +411,7 @@ private:
         case conv::ConversationEventType::SpeechStopped:
             ESP_LOGI(kTag, "user speech stopped");
             if (local_ == Local::Listening) {
-                local_ = Local::Thinking;
+                set_local(Local::Thinking);
                 thinking_since_ms_ = now_ms();
             }
             break;

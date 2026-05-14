@@ -30,12 +30,12 @@ public:
     // write_goal_position. Used for snappy gestures (head shake).
     std::atomic<std::uint16_t> servo_speed_override{0};
 
-    // True while a conversation session is live. demo_loop reads this to
-    // suspend its babble / random poses / nadenade / mouth-sync so it doesn't
-    // fight the conversation task for the I2S bus and the avatar.
+    // True while a conversation session is live (set by the conversation task).
     std::atomic<bool> conversation_active{false};
-    // Mirror of conversation::ConversationState for display / debugging.
-    std::atomic<int> conversation_state{0};
+    // True while the conversation is idly listening (not thinking / speaking).
+    // demo_loop runs its idle behaviours (random head poses, nadenade) when
+    // this is set, but keeps babble / expression-cycle / mouth-sync to itself.
+    std::atomic<bool> conversation_idle{false};
 
     // Show `text` in the balloon.
     //  - hold_ms: minimum on-screen time (0 = use avatar defaults — short

@@ -145,46 +145,57 @@ void demo_loop()
 
         const std::uint32_t now_ms = static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
 
-        // While a conversation session is live the conversation task owns the
-        // I2S bus, the avatar mouth, and the balloon — stand the demo behaviour
-        // down entirely so the two don't fight.
-        if (g_state->conversation_active.load(std::memory_order_relaxed)) {
+        const bool conv_active = g_state->conversation_active.load(std::memory_order_relaxed);
+        const bool conv_idle = g_state->conversation_idle.load(std::memory_order_relaxed);
+        // Idle behaviours (random head poses, nadenade) run when there is no
+        // conversation OR the conversation is idly listening. The full demo
+        // (mouth-sync, Wi-Fi balloon, babble, expression cycle) runs only when
+        // there is no conversation at all — otherwise it would fight the
+        // conversation task for the avatar and the I2S bus.
+        const bool allow_idle_demo = !conv_active || conv_idle;
+        const bool allow_full_demo = !conv_active;
+
+        // While the conversation is thinking / speaking it owns the avatar —
+        // stand down completely.
+        if (!allow_idle_demo) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // Mouth opens with the current speech envelope; closed while silent.
-        g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
+        if (allow_full_demo) {
+            // Mouth opens with the current speech envelope; closed while silent.
+            g_state->mouth_open.store(speech.current_mouth_open(), std::memory_order_relaxed);
 
-        const bool wifi_ok = app::wifi_is_connected();
-        if (!wifi_ok && !wifi_warning_active) {
-            speech.stop();
-            // hold_ms = UINT32_MAX so the balloon stays put until we clear it.
-            g_state->set_balloon_text("Wi-Fi: 切断中", /*hold_ms=*/UINT32_MAX);
-            balloon_in_flight.store(false, std::memory_order_release);
-            wifi_warning_active = true;
-        } else if (wifi_ok && wifi_warning_active) {
-            g_state->clear_balloon();
-            wifi_warning_active = false;
-            next_speech_ms = now_ms + 1500;
-        }
-
-        // Kick off a new babble + balloon once the previous balloon is done
-        // (callback resets balloon_in_flight) AND audio is idle AND the random
-        // dwell time has elapsed. Suppressed while Wi-Fi is down so the
-        // disconnected balloon stays visible.
-        if (!wifi_warning_active &&
-            now_ms >= next_speech_ms &&
-            !speech.is_speaking() &&
-            !balloon_in_flight.load(std::memory_order_acquire)) {
-            speech.babble(now_ms);
-            constexpr std::size_t kPhraseCount = sizeof(kPhrases) / sizeof(kPhrases[0]);
-            const char* phrase = kPhrases[esp_random() % kPhraseCount];
-            balloon_in_flight.store(true, std::memory_order_release);
-            g_state->set_balloon_text(phrase, /*hold_ms=*/0, [] {
+            const bool wifi_ok = app::wifi_is_connected();
+            if (!wifi_ok && !wifi_warning_active) {
+                speech.stop();
+                // hold_ms = UINT32_MAX so the balloon stays put until we clear it.
+                g_state->set_balloon_text("Wi-Fi: 切断中", /*hold_ms=*/UINT32_MAX);
                 balloon_in_flight.store(false, std::memory_order_release);
-            });
-            next_speech_ms = now_ms + rand_range_ms(kSpeechMinMs, kSpeechMaxMs);
+                wifi_warning_active = true;
+            } else if (wifi_ok && wifi_warning_active) {
+                g_state->clear_balloon();
+                wifi_warning_active = false;
+                next_speech_ms = now_ms + 1500;
+            }
+
+            // Kick off a new babble + balloon once the previous balloon is done
+            // (callback resets balloon_in_flight) AND audio is idle AND the
+            // random dwell time has elapsed. Suppressed while Wi-Fi is down so
+            // the disconnected balloon stays visible.
+            if (!wifi_warning_active &&
+                now_ms >= next_speech_ms &&
+                !speech.is_speaking() &&
+                !balloon_in_flight.load(std::memory_order_acquire)) {
+                speech.babble(now_ms);
+                constexpr std::size_t kPhraseCount = sizeof(kPhrases) / sizeof(kPhrases[0]);
+                const char* phrase = kPhrases[esp_random() % kPhraseCount];
+                balloon_in_flight.store(true, std::memory_order_release);
+                g_state->set_balloon_text(phrase, /*hold_ms=*/0, [] {
+                    balloon_in_flight.store(false, std::memory_order_release);
+                });
+                next_speech_ms = now_ms + rand_range_ms(kSpeechMinMs, kSpeechMaxMs);
+            }
         }
 
         // Nadenade: poll the top sensor, debounce, and on a sustained touch
@@ -243,8 +254,9 @@ void demo_loop()
             next_pose_ms = now_ms + rand_range_ms(kPoseMinMs, kPoseMaxMs);
         }
 
-        // Cycle expression every 5 s.
-        if (now_ms >= next_expression_ms) {
+        // Cycle expression every 5 s — full demo only; during a conversation
+        // the model drives the expression via the set_expression tool.
+        if (allow_full_demo && now_ms >= next_expression_ms) {
             g_state->expression.store(static_cast<int>(kCycle[expression_index]), std::memory_order_relaxed);
             expression_index = (expression_index + 1) % (sizeof(kCycle) / sizeof(kCycle[0]));
             next_expression_ms = now_ms + kExpressionPeriodMs;
