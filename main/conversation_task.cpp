@@ -25,6 +25,8 @@
 #include "conversation/openai_realtime_client.hpp"
 #include "wifi_sta.hpp"
 
+#include <jtts/jtts.hpp>
+
 namespace stackchan::app {
 
 namespace {
@@ -75,7 +77,9 @@ enum class Local : std::uint8_t {
 const char* kInstructions =
     "あなたは「スタックチャン」という小さな卓上ロボットです。M5Stack CoreS3 で動いています。"
     "フレンドリーで元気いっぱい、少し子供っぽい口調で、短く返事をします。ユーザーとは日本語で会話してください。"
-    "顔の表情と首の向きを変えられます。気持ちに合わせて set_expression や set_head_pose ツールを使ってください。";
+    "顔の表情と首の向きを変えられます。気持ちに合わせて set_expression や set_head_pose ツールを使ってください。"
+    "また speak_katakoto ツールでロボット風のカタコト声を出すこともできます。"
+    "ものまね・効果音・繰り返しなど演出的に使ってください（ツール呼び出しのターンでは普通の声で続けて喋らなくて構いません）。";
 
 conv::ToolDefinition make_set_expression_tool()
 {
@@ -97,6 +101,48 @@ conv::ToolDefinition make_set_head_pose_tool()
             R"({"type":"object","properties":{)"
             R"("yaw_deg":{"type":"number"},"pitch_deg":{"type":"number"}},"required":["yaw_deg","pitch_deg"]})",
     };
+}
+
+conv::ToolDefinition make_speak_katakoto_tool()
+{
+    return conv::ToolDefinition{
+        .name = "speak_katakoto",
+        .description =
+            "ロボット風のカタコト声で短いフレーズを発話する。"
+            "kana にはひらがな・カタカナ・長音『ー』・促音『っ』・空白のみを指定する（漢字は不可）。"
+            "例: \"ぴこーん\" / \"こんにちわー\" / \"がんばるぞー\"。",
+        .parameters_json =
+            R"({"type":"object","properties":{)"
+            R"("kana":{"type":"string","maxLength":48}},"required":["kana"]})",
+    };
+}
+
+// Minimal UTF-8 → UTF-32 decoder. Invalid bytes are skipped silently — jtts
+// will reject unknown code points downstream as InvalidKana.
+std::u32string decode_utf8(std::string_view s)
+{
+    std::u32string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        const auto c = static_cast<std::uint8_t>(s[i]);
+        std::uint32_t cp = 0;
+        std::size_t extra = 0;
+        if (c < 0x80) { cp = c; extra = 0; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+        else { ++i; continue; }
+        if (i + extra >= s.size()) break;
+        bool ok = true;
+        for (std::size_t j = 1; j <= extra; ++j) {
+            const auto cc = static_cast<std::uint8_t>(s[i + j]);
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (ok) out.push_back(static_cast<char32_t>(cp));
+        i += extra + 1;
+    }
+    return out;
 }
 
 std::optional<avatar::Expression> parse_expression(const char* name)
@@ -205,6 +251,7 @@ private:
         cfg.output_sample_rate_hz = kSpeakerSampleRate; // 8 kHz selects g711_ulaw on the wire
         cfg.tools.push_back(make_set_expression_tool());
         cfg.tools.push_back(make_set_head_pose_tool());
+        cfg.tools.push_back(make_speak_katakoto_tool());
         config_ = cfg;
 
         set_local(Local::Init);
@@ -509,6 +556,8 @@ private:
             result = handle_set_expression(call.arguments_json);
         } else if (call.name == "set_head_pose") {
             result = handle_set_head_pose(call.arguments_json);
+        } else if (call.name == "speak_katakoto") {
+            result = handle_speak_katakoto(call.arguments_json);
         }
 
         // The model will issue a follow-up response after we return the tool
@@ -539,6 +588,109 @@ private:
         }
         cJSON_Delete(root);
         return result;
+    }
+
+    // Synthesise the kana phrase through jtts and play it through the speaker.
+    // Blocks the conversation task until playback drains, so the tool result
+    // is sent back only after the audible utterance finishes — this avoids
+    // overlapping with any follow-up reply the model might produce. The PCM
+    // is generated into a PSRAM vector then streamed through seg_buf_ (the
+    // same internal-RAM ring used by reply playback) to dodge PSRAM contention.
+    std::string handle_speak_katakoto(const std::string& args)
+    {
+        cJSON* root = cJSON_Parse(args.c_str());
+        if (root == nullptr) {
+            return R"({"ok":false,"error":"bad arguments"})";
+        }
+        const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, "kana");
+        std::string kana_utf8;
+        if (cJSON_IsString(item) && item->valuestring != nullptr) {
+            kana_utf8 = item->valuestring;
+        }
+        cJSON_Delete(root);
+        if (kana_utf8.empty()) {
+            return R"({"ok":false,"error":"kana required"})";
+        }
+
+        const std::u32string kana = decode_utf8(kana_utf8);
+        if (kana.empty()) {
+            return R"({"ok":false,"error":"invalid utf8"})";
+        }
+
+        // Robotic-katakoto preset: low monotone male voice, slightly halting
+        // mora pace. Deliberately different from the assistant's normal voice
+        // so the user clearly hears it as a separate "mode".
+        constexpr std::uint32_t kKatakotoRate = 16000;
+        stackchan::jtts::Options opt;
+        opt.voice = stackchan::jtts::Voice::Male;
+        opt.f0_hz = 140.0f;
+        opt.mora_ms = 140.0f;
+        opt.gain = 0.8f;
+        opt.sample_rate_hz = kKatakotoRate;
+
+        std::vector<std::int16_t> pcm;
+        auto r = stackchan::jtts::synthesize(kana, pcm, opt);
+        if (!r) {
+            ESP_LOGW(kTag, "jtts synthesize failed: %s",
+                     stackchan::jtts::to_string(r.error()));
+            return R"({"ok":false,"error":"synthesize failed"})";
+        }
+        if (pcm.empty()) {
+            return R"({"ok":true,"warning":"empty audio"})";
+        }
+
+        // I2S handoff: mic → speaker. We may be in Listening (mic primed) or
+        // Thinking (mic primed but not being drained); either way the bus
+        // needs to belong to the speaker before playRaw.
+        M5.Mic.end();
+        vTaskDelay(kI2sSettle);
+
+        // Pre-compute peak envelope so the avatar mouth opens in sync with the
+        // utterance even though we're not running the normal service_playback.
+        const std::size_t env_window = kKatakotoRate * kEnvelopeStepMs / 1000u;
+        std::vector<float> envelope;
+        if (env_window > 0) {
+            envelope.reserve((pcm.size() + env_window - 1) / env_window);
+            for (std::size_t i = 0; i < pcm.size(); i += env_window) {
+                std::int32_t peak = 0;
+                const std::size_t end = std::min(i + env_window, pcm.size());
+                for (std::size_t j = i; j < end; ++j) {
+                    peak = std::max(peak, std::abs(static_cast<std::int32_t>(pcm[j])));
+                }
+                envelope.push_back(static_cast<float>(peak) / 32767.0f);
+            }
+        }
+
+        auto update_mouth_from_envelope = [&](std::uint32_t elapsed_ms) {
+            const std::size_t idx = elapsed_ms / kEnvelopeStepMs;
+            const float open = idx < envelope.size() ? envelope[idx] : 0.0f;
+            state_.mouth_open.store(open, std::memory_order_relaxed);
+        };
+
+        const std::uint32_t start_ms = now_ms();
+        std::size_t pos = 0;
+        std::size_t next = 0;
+        while (pos < pcm.size()) {
+            if (M5.Speaker.isPlaying(kSpeakerChannel) < kSegmentBuffers - 1) {
+                const std::size_t n = std::min(kSegmentSamples, pcm.size() - pos);
+                std::memcpy(seg_buf_[next], pcm.data() + pos, n * sizeof(std::int16_t));
+                M5.Speaker.playRaw(seg_buf_[next], n, kKatakotoRate, /*stereo=*/false,
+                                   /*repeat=*/1, kSpeakerChannel, /*stop_current_sound=*/false);
+                pos += n;
+                next = (next + 1) % kSegmentBuffers;
+            }
+            update_mouth_from_envelope(now_ms() - start_ms);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        while (M5.Speaker.isPlaying(kSpeakerChannel) > 0) {
+            update_mouth_from_envelope(now_ms() - start_ms);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        M5.Speaker.end();
+        vTaskDelay(kI2sSettle);
+        state_.mouth_open.store(0.0f, std::memory_order_relaxed);
+        return R"({"ok":true})";
     }
 
     std::string handle_set_head_pose(const std::string& args)
