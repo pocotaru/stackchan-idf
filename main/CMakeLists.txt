@@ -14,6 +14,7 @@ idf_component_register(
         avatar
         conversation
         config_service
+        jtts
         json
         M5Unified
         M5GFX
