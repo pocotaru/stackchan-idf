@@ -14,7 +14,18 @@ struct DeviceConfig {
     std::string openai_api_key;
 };
 
-enum class Error { NvsInit, NvsWrite, NimbleInit, GapAdvStart, GattRegister };
+enum class Error {
+    NvsInit,
+    NvsWrite,
+    NimbleInit,
+    GapAdvStart,
+    GattRegister,
+    // Application-layer crypto session (X25519 + AES-256-GCM).
+    CryptoNotReady, // operation attempted before key exchange completed
+    CryptoBadKey,   // peer pubkey rejected / ECDH failed
+    CryptoAuth,     // AES-GCM authentication tag mismatch
+    CryptoRng,      // ctr_drbg seeding / random failure
+};
 
 // Read device config from NVS namespace "stackchan_cfg". Missing keys → empty string.
 DeviceConfig load();

@@ -129,6 +129,9 @@ static int gap_event_cb(struct ble_gap_event* event, void* /*arg*/)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(kTag, "disconnected: reason=%d", event->disconnect.reason);
         gatt::set_subscribe(BLE_HS_CONN_HANDLE_NONE, false);
+        // Drop the X25519 / AES-GCM key material — the next connection runs
+        // a fresh handshake. No persistent bonding, no key reuse.
+        gatt::reset_session();
         start_advertising();
         break;
 

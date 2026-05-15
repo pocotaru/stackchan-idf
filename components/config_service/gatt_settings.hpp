@@ -22,4 +22,8 @@ void set_subscribe(uint16_t conn_handle, bool subscribed);
 // Thread-safe — may be called from any task.
 void set_wifi_connected(bool connected);
 
+// Drop application-layer crypto session state. Call on BLE disconnect so the
+// next connection runs a fresh X25519 handshake.
+void reset_session();
+
 } // namespace stackchan::config::gatt

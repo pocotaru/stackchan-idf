@@ -153,9 +153,9 @@
   <div class="log" id="log"></div>
 
   <p class="compat-note">
-    Chrome / Edge (デスクトップ) + <code>file://</code> で動作します。
+    Chrome / Edge (デスクトップ) <strong>133 以降</strong> + <code>file://</code> で動作します。
     Firefox・Safari は Web Bluetooth 非対応です。<br>
-    初回アクセス時に OS の Just Works ペアリング（PIN なし）が発生します。
+    通信は接続ごとに X25519 + AES-256-GCM で暗号化されます（OS ペアリング不要）。
   </p>
 </div>
 
@@ -167,10 +167,12 @@ const CHR_PASS    = 'e3f0a002-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_KEY     = 'e3f0a003-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_APPLY   = 'e3f0a004-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_STATUS  = 'e3f0a005-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_KX      = 'e3f0a006-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 
 // --- State ---
 let bleDevice = null, bleServer = null, svc = null;
-let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null;
+let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null;
+let aesKey = null;  // CryptoKey for AES-256-GCM, derived per connection
 
 // --- Log ---
 const logEl = document.getElementById('log');
@@ -211,39 +213,81 @@ const dec = new TextDecoder();
 
 function strToBytes(s) { return enc.encode(s); }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// --- Crypto helpers (X25519 ECDH → HKDF-SHA256 → AES-256-GCM) ---
 
-// Retry a GATT operation that fails because OS-level pairing is mid-flight.
-// The first access to an encryption-required characteristic triggers Just
-// Works pairing in the OS; until it completes, Chrome reports the op as
-// "Connection already in progress" / similar. Wait and retry.
-async function retryGatt(op, label) {
-  // OS-level Just Works pairing (especially the very first time) can take
-  // 15-20 seconds on Linux / BlueZ. Retry on a fixed cadence until pairing
-  // completes.
-  const transient = /already in progress|Connection attempt failed|Authentication failed|GATT operation failed/i;
-  const ATTEMPTS = 10;
-  const DELAY_MS = 3000;
-  let lastErr;
-  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    try { return await op(); }
-    catch (e) {
-      lastErr = e;
-      if (transient.test(e.message || '') && attempt < ATTEMPTS) {
-        log(`${label} ペアリング待機中 (${attempt}/${ATTEMPTS})…`, 'info');
-        await sleep(DELAY_MS);
-        continue;
-      }
-      throw e;
-    }
+// Probe browser X25519 support. Chrome / Edge 133+ shipped it GA; older
+// versions fail at generateKey.
+async function ensureX25519Supported() {
+  try {
+    await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+  } catch (e) {
+    throw new Error('X25519 非対応のブラウザです (Chrome / Edge 133 以降が必要)');
   }
-  throw lastErr;
+}
+
+// Run the application-layer handshake against the device:
+//   1. Read device's 32-byte ephemeral pubkey from KeyExchange (plaintext).
+//   2. Generate our own X25519 keypair.
+//   3. ECDH → 32-byte shared secret → HKDF-SHA256 → AES-256 key.
+//   4. Write our pubkey to KeyExchange to commit the device side.
+// On success `aesKey` is a non-extractable CryptoKey usable for AES-GCM.
+async function setupSession() {
+  const devicePubRaw = new Uint8Array((await chrKx.readValue()).buffer);
+  if (devicePubRaw.length !== 32) {
+    throw new Error(`device pubkey length ${devicePubRaw.length} != 32`);
+  }
+  const ourKp = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+  const devicePub = await crypto.subtle.importKey('raw', devicePubRaw, { name: 'X25519' }, false, []);
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'X25519', public: devicePub }, ourKp.privateKey, 256);
+  const ikm = await crypto.subtle.importKey(
+    'raw', sharedBits, { name: 'HKDF' }, false, ['deriveKey']);
+  aesKey = await crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: new Uint8Array(0),
+      info: enc.encode('stackchan-config-v1'),
+    },
+    ikm,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']);
+  const ourPubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', ourKp.publicKey));
+  await chrKx.writeValueWithResponse(ourPubRaw);
+}
+
+// Decrypt a characteristic READ. Wire format: [12B nonce][ct][16B tag].
+async function readEncrypted(chr) {
+  const wire = new Uint8Array((await chr.readValue()).buffer);
+  if (wire.length < 12 + 16) throw new Error('encrypted read too short');
+  const iv = wire.subarray(0, 12);
+  const ctTag = wire.subarray(12);
+  const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ctTag);
+  return new Uint8Array(ptBuf);
+}
+
+// Encrypt a payload and write it. Same wire format.
+async function writeEncrypted(chr, plainBytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ctTag = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plainBytes));
+  const wire = new Uint8Array(iv.length + ctTag.length);
+  wire.set(iv, 0);
+  wire.set(ctTag, iv.length);
+  await chr.writeValueWithResponse(wire);
 }
 
 // --- Connect ---
 document.getElementById('btn-connect').addEventListener('click', async () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth が使えません。Chrome / Edge デスクトップで開いてください。', 'err');
+    return;
+  }
+  try {
+    await ensureX25519Supported();
+  } catch (e) {
+    log(e.message, 'err');
     return;
   }
   document.getElementById('ble-dot').className = 'dot ble-connecting';
@@ -263,21 +307,23 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     log('GATT 接続完了', 'ok');
 
     svc = await bleServer.getPrimaryService(SVC_UUID);
-    [chrSsid, chrPass, chrKey, chrApply, chrStatus] = await Promise.all([
+    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx] = await Promise.all([
       svc.getCharacteristic(CHR_SSID),
       svc.getCharacteristic(CHR_PASS),
       svc.getCharacteristic(CHR_KEY),
       svc.getCharacteristic(CHR_APPLY),
       svc.getCharacteristic(CHR_STATUS),
+      svc.getCharacteristic(CHR_KX),
     ]);
     log('Characteristics 取得完了', 'ok');
 
-    // Read current SSID and Status. The first read triggers Just Works
-    // pairing; while pairing is in-flight Chrome rejects subsequent ops as
-    // "Connection already in progress", so retryGatt retries with backoff.
+    // X25519 handshake. After this, every other read/write is encrypted.
+    await setupSession();
+    log('鍵交換完了 (X25519 + AES-256-GCM)', 'ok');
+
     try {
-      const ssidVal = await retryGatt(() => chrSsid.readValue(), 'SSID 読み取り');
-      const ssidStr = dec.decode(ssidVal);
+      const ssidBytes = await readEncrypted(chrSsid);
+      const ssidStr = dec.decode(ssidBytes);
       if (ssidStr) {
         document.getElementById('ssid').placeholder = ssidStr + ' (現在の値)';
         log(`現在の SSID: ${ssidStr}`);
@@ -287,16 +333,26 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     }
 
     try {
-      const stVal = await retryGatt(() => chrStatus.readValue(), 'Status 読み取り');
-      updateStatus(stVal);
+      const stBytes = await readEncrypted(chrStatus);
+      updateStatus(new DataView(stBytes.buffer, stBytes.byteOffset, stBytes.byteLength));
     } catch (e) {
       log(`Status 読み取りエラー: ${e.message}`, 'err');
     }
 
-    // Subscribe to Status notifications for live Wi-Fi updates.
-    await retryGatt(() => chrStatus.startNotifications(), 'Status 通知登録');
-    chrStatus.addEventListener('characteristicvaluechanged', e => {
-      updateStatus(e.target.value);
+    // Subscribe to Status notifications — notify payloads are encrypted too.
+    await chrStatus.startNotifications();
+    chrStatus.addEventListener('characteristicvaluechanged', async e => {
+      try {
+        const wire = new Uint8Array(e.target.value.buffer);
+        if (wire.length < 12 + 16) return;
+        const iv = wire.subarray(0, 12);
+        const ctTag = wire.subarray(12);
+        const pt = new Uint8Array(
+          await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ctTag));
+        updateStatus(new DataView(pt.buffer, pt.byteOffset, pt.byteLength));
+      } catch (err) {
+        log(`Status 通知の復号エラー: ${err.message}`, 'err');
+      }
     });
     log('Status 通知を登録しました', 'ok');
 
@@ -314,7 +370,8 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
 function onDisconnected() {
   log('切断されました', 'err');
   setBleUi(false);
-  chrSsid = chrPass = chrKey = chrApply = chrStatus = null;
+  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = null;
+  aesKey = null;
 }
 
 // --- Manual disconnect ---
@@ -335,25 +392,24 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
   btn.textContent = '保存中…';
 
   try {
-    // Write only fields that have input (empty = unchanged). Secret writes
-    // require an encrypted link, so the FIRST encryption-required write here
-    // triggers OS Just Works pairing — retryGatt waits for it to complete.
+    // Write only fields that have input (empty = unchanged). All payloads
+    // travel through the AES-GCM session established at connect.
     if (ssid) {
-      await retryGatt(() => chrSsid.writeValueWithResponse(strToBytes(ssid)), 'SSID 書き込み');
+      await writeEncrypted(chrSsid, strToBytes(ssid));
       log('SSID 書き込み完了', 'ok');
     }
     if (pass) {
-      await retryGatt(() => chrPass.writeValueWithResponse(strToBytes(pass)), 'パスワード 書き込み');
+      await writeEncrypted(chrPass, strToBytes(pass));
       log('パスワード 書き込み完了', 'ok');
     }
     if (key) {
-      await retryGatt(() => chrKey.writeValueWithResponse(strToBytes(key)), 'API キー 書き込み');
+      await writeEncrypted(chrKey, strToBytes(key));
       log('API キー 書き込み完了', 'ok');
     }
 
     log('Apply を送信しています…');
-    // Sentinel: single byte 0x01. Apply also requires encryption.
-    await retryGatt(() => chrApply.writeValueWithResponse(new Uint8Array([0x01])), 'Apply');
+    // Sentinel: single byte 0x01, encrypted like everything else.
+    await writeEncrypted(chrApply, new Uint8Array([0x01]));
     log('Apply 完了 — デバイスが再起動します', 'ok');
     btn.textContent = '再起動中…';
     // Device reboots ~200 ms after Apply; disconnection event will fire shortly.
