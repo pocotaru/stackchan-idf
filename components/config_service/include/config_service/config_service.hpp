@@ -18,6 +18,11 @@ struct DeviceConfig {
     // losing setup). Defaults to true for backwards compatibility with
     // existing NVS contents that pre-date this flag.
     bool openai_enabled = true;
+    // JSON document carrying the user-tunable jtts babble parameters and
+    // phrase list. The producer (BLE client) writes the raw JSON; the
+    // consumer (main/speech.cpp) parses on startup. Empty → compile-time
+    // defaults. Capped at ~768 bytes plain text on the wire.
+    std::string jtts_config_json;
 };
 
 enum class Error {

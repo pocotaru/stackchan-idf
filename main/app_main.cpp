@@ -73,7 +73,7 @@ void record_and_playback(std::uint32_t seconds, const char* label)
     ESP_LOGI(kTag, "%s: done", label);
 }
 
-void demo_loop()
+void demo_loop(const std::string& jtts_config_json)
 {
     using namespace stackchan;
 
@@ -110,6 +110,7 @@ void demo_loop()
     };
 
     static app::Speech speech;
+    speech.configure(jtts_config_json);
 
     auto rand_in = [](float low, float high) {
         const float u = static_cast<float>(esp_random()) / static_cast<float>(UINT32_MAX);
@@ -374,5 +375,5 @@ extern "C" void app_main()
     stackchan::app::start_conversation_task(*g_conversation_args);
 
     ESP_LOGI(kTag, "ready");
-    demo_loop();
+    demo_loop(cfg.jtts_config_json);
 }

@@ -2,26 +2,32 @@
 // SPDX-License-Identifier: BSL-1.0
 
 #include "speech.hpp"
+#include "utf8.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 #include <vector>
 
 #include <M5Unified.h>
+#include <cJSON.h>
+#include <esp_log.h>
 #include <esp_timer.h>
-
-#include <jtts/jtts.hpp>
 
 namespace stackchan::app {
 
 namespace {
 
-// 番評語 (係助詞「は/へ」は発音通り「わ/え」と表記、「を」は「お」と書く)。
-// 漢字変換は無いので、すべてひらがな + 拗音 + 「ー」「っ」「ん」のみ。
-constexpr std::u32string_view kPhrases[] = {
+constexpr const char* kTag = "speech";
+
+// Compile-time defaults — used when no JttsConfig has been written over BLE
+// (fresh device, or empty JSON). The phrase set is hiragana + 拗音 + 「ー」
+// 「っ」「ん」 only — jtts has no kana-to-phoneme dictionary so kanji are
+// rejected as InvalidKana.
+constexpr std::u32string_view kDefaultPhrases[] = {
     U"こんにちわー",
     U"おはよー",
     U"やっほー",
@@ -31,6 +37,31 @@ constexpr std::u32string_view kPhrases[] = {
     U"げんき げんき",
     U"わたしわ すたっくちゃん",
 };
+
+jtts::Options default_options(std::uint32_t sample_rate)
+{
+    jtts::Options opt;
+    opt.voice = jtts::Voice::Female;
+    opt.f0_hz = 280.0f;       // child preset
+    opt.formant_scale = 1.30f;
+    opt.mora_ms = 120.0f;
+    opt.sample_rate_hz = sample_rate;
+    return opt;
+}
+
+// cJSON helpers. Numeric fields are accepted as JSON numbers; voice is a
+// string ("male"/"female"); missing fields keep their current value.
+void apply_voice(jtts::Options& opt, const cJSON* item)
+{
+    if (!cJSON_IsString(item) || item->valuestring == nullptr) return;
+    if (std::strcmp(item->valuestring, "male") == 0) opt.voice = jtts::Voice::Male;
+    else if (std::strcmp(item->valuestring, "female") == 0) opt.voice = jtts::Voice::Female;
+}
+
+void apply_number(float& dst, const cJSON* item)
+{
+    if (cJSON_IsNumber(item)) dst = static_cast<float>(item->valuedouble);
+}
 
 void build_envelope_from_pcm(const std::vector<std::int16_t>& pcm,
                              std::vector<float>& envelope, std::uint32_t sample_rate,
@@ -57,20 +88,69 @@ void build_envelope_from_pcm(const std::vector<std::int16_t>& pcm,
 
 } // namespace
 
+void Speech::configure(const std::string& json)
+{
+    // Compile-time fallback always runs first so configure() is idempotent
+    // and missing JSON fields don't pick up stale state.
+    opts_ = default_options(kSampleRate);
+    phrases_.clear();
+    for (auto v : kDefaultPhrases) {
+        phrases_.emplace_back(v);
+    }
+    initialised_ = true;
+
+    if (json.empty()) {
+        return;
+    }
+    cJSON* root = cJSON_Parse(json.c_str());
+    if (root == nullptr) {
+        ESP_LOGW(kTag, "jtts config: JSON parse failed, using defaults");
+        return;
+    }
+
+    apply_voice(opts_, cJSON_GetObjectItemCaseSensitive(root, "voice"));
+    apply_number(opts_.f0_hz, cJSON_GetObjectItemCaseSensitive(root, "f0_hz"));
+    apply_number(opts_.formant_scale, cJSON_GetObjectItemCaseSensitive(root, "formant_scale"));
+    apply_number(opts_.mora_ms, cJSON_GetObjectItemCaseSensitive(root, "mora_ms"));
+    apply_number(opts_.gain, cJSON_GetObjectItemCaseSensitive(root, "gain"));
+    apply_number(opts_.breathiness, cJSON_GetObjectItemCaseSensitive(root, "breathiness"));
+    apply_number(opts_.voicing_mul, cJSON_GetObjectItemCaseSensitive(root, "voicing_mul"));
+    apply_number(opts_.frication_mul, cJSON_GetObjectItemCaseSensitive(root, "frication_mul"));
+    apply_number(opts_.vibrato_rate_hz, cJSON_GetObjectItemCaseSensitive(root, "vibrato_rate_hz"));
+    apply_number(opts_.vibrato_cents, cJSON_GetObjectItemCaseSensitive(root, "vibrato_cents"));
+
+    const cJSON* phrases = cJSON_GetObjectItemCaseSensitive(root, "phrases");
+    if (cJSON_IsArray(phrases)) {
+        std::vector<std::u32string> parsed;
+        const cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, phrases) {
+            if (!cJSON_IsString(item) || item->valuestring == nullptr) continue;
+            auto u32 = decode_utf8(item->valuestring);
+            if (!u32.empty()) parsed.push_back(std::move(u32));
+        }
+        if (!parsed.empty()) phrases_ = std::move(parsed);
+    }
+    cJSON_Delete(root);
+    ESP_LOGI(kTag, "jtts config: voice=%s f0=%.0f mora=%.0fms phrases=%zu",
+             opts_.voice == jtts::Voice::Female ? "female" : "male",
+             opts_.f0_hz, opts_.mora_ms, phrases_.size());
+}
+
 void Speech::babble(std::uint32_t seed)
 {
-    constexpr std::size_t kNumPhrases = sizeof(kPhrases) / sizeof(kPhrases[0]);
-    const std::u32string_view kana = kPhrases[seed % kNumPhrases];
+    if (!initialised_) {
+        configure(""); // first-call lazy init with defaults
+    }
+    if (phrases_.empty()) {
+        return;
+    }
+    const std::u32string& kana = phrases_[seed % phrases_.size()];
 
-    stackchan::jtts::Options opt;
-    opt.voice = stackchan::jtts::Voice::Female;
-    opt.f0_hz = 280.0f;          // child preset (CLI と同一)
-    opt.formant_scale = 1.30f;
-    opt.mora_ms = 120.0f;
-    opt.sample_rate_hz = kSampleRate;
+    jtts::Options opt = opts_;
+    opt.sample_rate_hz = kSampleRate; // playback rate is fixed for envelope sync
 
     pcm_.clear();
-    auto r = stackchan::jtts::synthesize(kana, pcm_, opt);
+    auto r = jtts::synthesize(kana, pcm_, opt);
     if (!r || pcm_.empty()) {
         return;
     }

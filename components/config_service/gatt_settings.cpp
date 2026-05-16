@@ -37,7 +37,7 @@ constexpr const char* kTag = "cfg-gatt";
 // Service: e3f0a000-7b1c-4d2a-9e6f-2c5a8d4b1f00
 // SSID:    e3f0a001-...  Pass: e3f0a002-...  Key: e3f0a003-...
 // Apply:   e3f0a004-...  Status: e3f0a005-...  KeyExchange: e3f0a006-...
-// OpenAiEnabled: e3f0a007-...
+// OpenAiEnabled: e3f0a007-...  JttsConfig: e3f0a008-...
 
 static const ble_uuid128_t kSvcUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
@@ -69,12 +69,17 @@ static const ble_uuid128_t kKeyExchangeUuid = BLE_UUID128_INIT(
 static const ble_uuid128_t kOpenAiEnabledUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
     0x2a, 0x4d, 0x1c, 0x7b, 0x07, 0xa0, 0xf0, 0xe3);
+// JttsConfig — encrypted JSON document carrying babble voice parameters and
+// the phrase list. Empty string falls back to compile-time defaults.
+static const ble_uuid128_t kJttsConfigUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x08, 0xa0, 0xf0, 0xe3);
 
 // --- Mutable state guarded by g_mutex ---
 static SemaphoreHandle_t g_mutex = nullptr;
 
 struct StagingBuffer {
-    std::optional<std::string> ssid, password, api_key;
+    std::optional<std::string> ssid, password, api_key, jtts_config;
     std::optional<bool> openai_enabled;
 };
 
@@ -92,6 +97,14 @@ static uint16_t g_apply_handle = 0;
 static uint16_t g_status_handle = 0;
 static uint16_t g_kx_handle = 0;
 static uint16_t g_enabled_handle = 0;
+static uint16_t g_jtts_handle = 0;
+
+// Largest plaintext payload we accept on a single write — chosen to fit the
+// jtts config JSON comfortably. The encrypted wire form adds 12 (nonce) + 16
+// (tag) bytes; the scratch buffer below is sized accordingly. NimBLE
+// reassembles prepared writes into a single mbuf chain that ble_hs_mbuf_to_flat
+// then drops into our buffer.
+constexpr std::size_t kMaxJttsConfigBytes = 768;
 
 // Per-connection application-layer crypto session. Reset on disconnect by
 // config_service.cpp so the next central re-runs the X25519 handshake.
@@ -182,14 +195,28 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             xSemaphoreGive(g_mutex);
             return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
         }
+        if (attr_handle == g_jtts_handle) {
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            if (!g_session.is_established()) {
+                xSemaphoreGive(g_mutex);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            const std::string json = g_active.jtts_config_json;
+            const bool ok = append_encrypted(
+                ctxt->om,
+                {reinterpret_cast<const std::uint8_t*>(json.data()), json.size()});
+            xSemaphoreGive(g_mutex);
+            return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
+        }
         return BLE_ATT_ERR_ATTR_NOT_FOUND;
     }
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        // Scratch buffer sized for the largest payload — encrypted API key
-        // (256 + 12 + 16 = 284). NimBLE's prepared write reassembly flattens
-        // long writes into this single mbuf chain.
-        std::array<std::uint8_t, 320> buf{};
+        // Scratch buffer sized for the largest payload. JttsConfig
+        // (kMaxJttsConfigBytes = 768) is currently the biggest; encrypted on
+        // the wire adds 12 (nonce) + 16 (tag) bytes. NimBLE's prepared write
+        // reassembly flattens long writes into this single mbuf chain.
+        std::array<std::uint8_t, 1024> buf{};
         uint16_t out_len = 0;
         int rc = ble_hs_mbuf_to_flat(ctxt->om, buf.data(),
                                       static_cast<uint16_t>(buf.size()), &out_len);
@@ -257,6 +284,14 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             xSemaphoreGive(g_mutex);
             return 0;
         }
+        if (attr_handle == g_jtts_handle) {
+            if (pt.size() > kMaxJttsConfigBytes) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            std::string val(reinterpret_cast<const char*>(pt.data()), pt.size());
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            g_staging.jtts_config = std::move(val);
+            xSemaphoreGive(g_mutex);
+            return 0;
+        }
         if (attr_handle == g_apply_handle) {
             if (pt.empty()) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
@@ -266,6 +301,7 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             if (g_staging.password) merged.wifi_password = *g_staging.password;
             if (g_staging.api_key) merged.openai_api_key = *g_staging.api_key;
             if (g_staging.openai_enabled) merged.openai_enabled = *g_staging.openai_enabled;
+            if (g_staging.jtts_config) merged.jtts_config_json = *g_staging.jtts_config;
             xSemaphoreGive(g_mutex);
 
             auto result = store::save(merged);
@@ -344,6 +380,12 @@ static ble_gatt_chr_def kChrs[] = {
         .access_cb = gatt_access_cb,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
         .val_handle = &g_enabled_handle,
+    },
+    {
+        .uuid = &kJttsConfigUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_jtts_handle,
     },
     {} // terminator: uuid = nullptr
 };

@@ -5,7 +5,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <vector>
+
+#include <jtts/jtts.hpp>
 
 namespace stackchan::app {
 
@@ -20,6 +23,12 @@ public:
 
     // Envelope window — one envelope sample covers this many ms of audio.
     static constexpr std::uint32_t kEnvelopeStepMs = 16;
+
+    // Override the compile-time voice preset and phrase list with values from
+    // a user-supplied JSON document (delivered over BLE, persisted in NVS).
+    // Missing or invalid fields fall back to the defaults — invalid JSON is
+    // ignored entirely. Call once at startup, before the first babble.
+    void configure(const std::string& json);
 
     // Start a fresh utterance (non-blocking — M5.Speaker queues it).
     // `seed` randomises pitch / syllable count so successive calls differ.
@@ -40,6 +49,13 @@ private:
     std::vector<float> envelope_;
     // PCM kept alive while M5.Speaker plays it asynchronously.
     std::vector<std::int16_t> pcm_;
+
+    // Voice preset + babble phrase list. configure() can overwrite these at
+    // boot; otherwise they hold the compile-time defaults (Female child
+    // preset, ~8 short Japanese phrases).
+    jtts::Options opts_;
+    std::vector<std::u32string> phrases_;
+    bool initialised_{false};
 
     std::atomic<std::uint32_t> start_ms_{0};
     std::atomic<std::uint32_t> duration_ms_{0};

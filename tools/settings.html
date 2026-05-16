@@ -94,6 +94,45 @@
     accent-color: #1976d2;
     cursor: pointer;
   }
+  .jtts-section {
+    margin-top: 1.25rem;
+    padding: 0.6rem 0.9rem;
+    background: #fafafa;
+    border: 1px solid #eee;
+    border-radius: 8px;
+  }
+  .jtts-section summary {
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #444;
+    user-select: none;
+  }
+  .jtts-section[open] summary { margin-bottom: 0.5rem; }
+  .jtts-section select,
+  .jtts-section input[type=number],
+  .jtts-section textarea {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    outline: none;
+    background: white;
+    transition: border-color 0.2s;
+  }
+  .jtts-section textarea {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    resize: vertical;
+    line-height: 1.5;
+  }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem 1rem;
+    margin-top: 0.25rem;
+  }
+  .grid2 > div label { margin-top: 0.5rem; }
   .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; flex-wrap: wrap; }
   button {
     padding: 0.55rem 1.2rem;
@@ -200,6 +239,51 @@
   </label>
   <p class="hint">オフにすると API キーは残したまま会話タスクを起動しません</p>
 
+  <details class="jtts-section" id="jtts-section">
+    <summary>アイドル時の声 (jtts) を調整する</summary>
+    <p class="hint" style="margin-bottom:0.5rem">空欄や変更なしで「保存」を押すと現在の設定は維持されます。</p>
+
+    <label for="jtts-voice">声タイプ</label>
+    <select id="jtts-voice">
+      <option value="female">Female (子供っぽい)</option>
+      <option value="male">Male (低め)</option>
+    </select>
+
+    <div class="grid2">
+      <div>
+        <label for="jtts-f0">ピッチ F0 (Hz)</label>
+        <input type="number" id="jtts-f0" min="60" max="500" step="1" placeholder="280">
+      </div>
+      <div>
+        <label for="jtts-formant">フォルマント倍率</label>
+        <input type="number" id="jtts-formant" min="0.5" max="2.0" step="0.05" placeholder="1.30">
+      </div>
+      <div>
+        <label for="jtts-mora">モーラ長 (ms)</label>
+        <input type="number" id="jtts-mora" min="40" max="300" step="5" placeholder="120">
+      </div>
+      <div>
+        <label for="jtts-gain">音量 (gain)</label>
+        <input type="number" id="jtts-gain" min="0" max="2" step="0.05" placeholder="0.60">
+      </div>
+      <div>
+        <label for="jtts-breath">息成分 (breathiness)</label>
+        <input type="number" id="jtts-breath" min="0" max="1" step="0.05" placeholder="0.00">
+      </div>
+      <div>
+        <label for="jtts-vibrate">ビブラート rate (Hz)</label>
+        <input type="number" id="jtts-vibrate" min="0" max="10" step="0.1" placeholder="0">
+      </div>
+      <div>
+        <label for="jtts-vibratoc">ビブラート depth (cents)</label>
+        <input type="number" id="jtts-vibratoc" min="0" max="200" step="1" placeholder="0">
+      </div>
+    </div>
+
+    <label for="jtts-phrases" style="margin-top:0.75rem">アイドル時の発話フレーズ (一行 1 つ・ひらがな/カタカナのみ)</label>
+    <textarea id="jtts-phrases" rows="6" placeholder="こんにちわー&#10;おはよー&#10;..."></textarea>
+  </details>
+
   <div class="actions">
     <button id="btn-connect">BLE 接続</button>
     <button id="btn-apply" disabled>保存 &amp; 再起動</button>
@@ -225,6 +309,7 @@ const CHR_APPLY   = 'e3f0a004-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_STATUS  = 'e3f0a005-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_KX      = 'e3f0a006-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_EN      = 'e3f0a007-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_JTTS    = 'e3f0a008-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 
 // Device Information Service (Bluetooth SIG-assigned, UUID 0x180A).
 // Web Bluetooth accepts the standard short names.
@@ -239,7 +324,8 @@ const DIS_CHRS = {
 
 // --- State ---
 let bleDevice = null, bleServer = null, svc = null;
-let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null;
+let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null, chrJtts = null;
+let jttsInitialJson = '';  // last read JSON, used to detect Apply-time changes
 let aesKey = null;  // CryptoKey for AES-256-GCM, derived per connection
 
 // --- Log ---
@@ -368,6 +454,70 @@ function clearDeviceInfo() {
   }
 }
 
+// --- jtts config form <-> JSON ---
+
+const JTTS_NUM_FIELDS = {
+  f0_hz:           'jtts-f0',
+  formant_scale:   'jtts-formant',
+  mora_ms:         'jtts-mora',
+  gain:            'jtts-gain',
+  breathiness:     'jtts-breath',
+  vibrato_rate_hz: 'jtts-vibrate',
+  vibrato_cents:   'jtts-vibratoc',
+};
+
+function readJttsForm() {
+  // Build a minimal JSON document — fields the user left blank are omitted
+  // so the device falls back to its compile-time defaults for those.
+  const obj = {};
+  const voice = document.getElementById('jtts-voice').value;
+  if (voice) obj.voice = voice;
+  for (const [key, id] of Object.entries(JTTS_NUM_FIELDS)) {
+    const v = document.getElementById(id).value.trim();
+    if (v !== '') {
+      const n = Number(v);
+      if (Number.isFinite(n)) obj[key] = n;
+    }
+  }
+  const phrases = document.getElementById('jtts-phrases').value
+    .split('\n').map(s => s.trim()).filter(s => s.length > 0);
+  if (phrases.length > 0) obj.phrases = phrases;
+  return obj;
+}
+
+function writeJttsForm(json) {
+  // Reset all inputs first so leftover state never bleeds across configs.
+  document.getElementById('jtts-voice').value = 'female';
+  for (const id of Object.values(JTTS_NUM_FIELDS)) {
+    document.getElementById(id).value = '';
+  }
+  document.getElementById('jtts-phrases').value = '';
+  if (!json) return;
+  let obj;
+  try { obj = JSON.parse(json); }
+  catch (e) { log(`jtts config: JSON parse failed (${e.message})`, 'err'); return; }
+  if (obj.voice === 'male' || obj.voice === 'female') {
+    document.getElementById('jtts-voice').value = obj.voice;
+  }
+  for (const [key, id] of Object.entries(JTTS_NUM_FIELDS)) {
+    if (typeof obj[key] === 'number') {
+      document.getElementById(id).value = obj[key];
+    }
+  }
+  if (Array.isArray(obj.phrases)) {
+    document.getElementById('jtts-phrases').value = obj.phrases.join('\n');
+  }
+}
+
+// Serialise form state for change-detection. JSON.stringify on a fresh object
+// with sorted keys gives us a canonical form we can compare against.
+function canonicaliseJttsForm() {
+  const obj = readJttsForm();
+  const sorted = {};
+  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
+  return JSON.stringify(sorted);
+}
+
 // Encrypt a payload and write it. Same wire format.
 async function writeEncrypted(chr, plainBytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -408,7 +558,7 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     log('GATT 接続完了', 'ok');
 
     svc = await bleServer.getPrimaryService(SVC_UUID);
-    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn] = await Promise.all([
+    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn, chrJtts] = await Promise.all([
       svc.getCharacteristic(CHR_SSID),
       svc.getCharacteristic(CHR_PASS),
       svc.getCharacteristic(CHR_KEY),
@@ -416,6 +566,7 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       svc.getCharacteristic(CHR_STATUS),
       svc.getCharacteristic(CHR_KX),
       svc.getCharacteristic(CHR_EN),
+      svc.getCharacteristic(CHR_JTTS),
     ]);
     log('Characteristics 取得完了', 'ok');
 
@@ -458,6 +609,20 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       log(`OpenAI 有効状態の取得失敗: ${e.message}`, 'err');
     }
 
+    try {
+      const jttsBytes = await readEncrypted(chrJtts);
+      const jttsJson = dec.decode(jttsBytes);
+      writeJttsForm(jttsJson);
+      jttsInitialJson = canonicaliseJttsForm();
+      if (jttsJson) {
+        log(`jtts 設定読み込み: ${jttsBytes.length}B`);
+      } else {
+        log('jtts 設定: ファーム既定値');
+      }
+    } catch (e) {
+      log(`jtts 設定の取得失敗: ${e.message}`, 'err');
+    }
+
     // Subscribe to Status notifications — notify payloads are encrypted too.
     await chrStatus.startNotifications();
     chrStatus.addEventListener('characteristicvaluechanged', async e => {
@@ -489,10 +654,12 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
 function onDisconnected() {
   log('切断されました', 'err');
   setBleUi(false);
-  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = null;
+  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = chrJtts = null;
   aesKey = null;
   clearDeviceInfo();
   delete document.getElementById('openai-enabled').dataset.initial;
+  jttsInitialJson = '';
+  writeJttsForm('');
 }
 
 // --- Manual disconnect ---
@@ -535,6 +702,16 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
     if (enInitial !== undefined && enInitial !== enWanted) {
       await writeEncrypted(chrEn, new Uint8Array([enCheckbox.checked ? 1 : 0]));
       log(`OpenAI 会話機能を ${enCheckbox.checked ? '有効' : '無効'} に切り替え`, 'ok');
+    }
+
+    // jtts: only write if the form contents differ from what we read.
+    const jttsCanonical = canonicaliseJttsForm();
+    if (jttsCanonical !== jttsInitialJson) {
+      const jttsObj = readJttsForm();
+      // Object.keys==0 means "fall back to firmware defaults" — send empty.
+      const payload = Object.keys(jttsObj).length === 0 ? '' : JSON.stringify(jttsObj);
+      await writeEncrypted(chrJtts, strToBytes(payload));
+      log(`jtts 設定を更新 (${payload.length}B)`, 'ok');
     }
 
     log('Apply を送信しています…');

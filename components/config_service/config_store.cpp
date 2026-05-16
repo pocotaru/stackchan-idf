@@ -20,6 +20,7 @@ constexpr const char* kKeySsid = "wifi_ssid";
 constexpr const char* kKeyPass = "wifi_pass";
 constexpr const char* kKeyApiKey = "openai_key";
 constexpr const char* kKeyOpenAiEnabled = "openai_en";
+constexpr const char* kKeyJttsConfig = "jtts_cfg";
 
 std::string nvs_read_str(nvs_handle_t h, const char* key)
 {
@@ -56,6 +57,7 @@ DeviceConfig load()
     cfg.wifi_ssid = nvs_read_str(h, kKeySsid);
     cfg.wifi_password = nvs_read_str(h, kKeyPass);
     cfg.openai_api_key = nvs_read_str(h, kKeyApiKey);
+    cfg.jtts_config_json = nvs_read_str(h, kKeyJttsConfig);
     // Default to enabled when the key is missing (pre-flag NVS contents).
     std::uint8_t enabled = 1;
     esp_err_t en_err = nvs_get_u8(h, kKeyOpenAiEnabled, &enabled);
@@ -81,6 +83,7 @@ tl::expected<void, Error> save(const DeviceConfig& cfg)
         {kKeySsid, cfg.wifi_ssid},
         {kKeyPass, cfg.wifi_password},
         {kKeyApiKey, cfg.openai_api_key},
+        {kKeyJttsConfig, cfg.jtts_config_json},
     };
     for (const auto& [key, value] : entries) {
         err = nvs_set_str(h, key, value.c_str());
