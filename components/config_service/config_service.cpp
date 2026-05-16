@@ -105,23 +105,14 @@ static int gap_event_cb(struct ble_gap_event* event, void* /*arg*/)
         break;
 
     case BLE_GAP_EVENT_LINK_ESTAB:
-        // The link is now fully established. ESP-IDF's NimBLE fires this
-        // separately from BLE_GAP_EVENT_CONNECT and uses it as the "definitive
-        // link-ready" event. Opportunistically request encryption here so a
-        // central with no stored bond gets prompted to pair (Just Works) —
-        // characteristics with _WRITE_ENC need this to succeed before secrets
-        // can be written. If the central already has a bond, NimBLE has
-        // already encrypted the link via the stored LTK; skip in that case.
+        // Confidentiality is provided by the application-layer X25519 +
+        // AES-256-GCM session (see components/config_service/crypto.cpp), so
+        // there's no need to initiate BLE-level pairing here. Earlier
+        // revisions did `ble_gap_security_initiate(...)` here as a bonus, but
+        // combined with a stored bond it provoked an SM repeat-pairing loop
+        // that pegged the NimBLE host task and tripped IDLE0's task WDT.
         if (event->link_estab.status == 0) {
             ESP_LOGI(kTag, "link established: handle=%d", event->link_estab.conn_handle);
-            struct ble_gap_conn_desc desc{};
-            if (ble_gap_conn_find(event->link_estab.conn_handle, &desc) == 0 &&
-                !desc.sec_state.encrypted) {
-                int rc = ble_gap_security_initiate(event->link_estab.conn_handle);
-                if (rc != 0 && rc != BLE_HS_EALREADY) {
-                    ESP_LOGW(kTag, "security_initiate: %d", rc);
-                }
-            }
         } else {
             ESP_LOGW(kTag, "link_estab failed: status=%d", event->link_estab.status);
         }
@@ -157,8 +148,18 @@ static int gap_event_cb(struct ble_gap_event* event, void* /*arg*/)
                  event->mtu.conn_handle, event->mtu.value);
         break;
 
-    case BLE_GAP_EVENT_REPEAT_PAIRING:
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        // If we ever receive an unsolicited pair request from a peer that
+        // already has a stored bond, drop the old bond before telling NimBLE
+        // to retry the pair operation — otherwise ble_sm_chk_repeat_pairing
+        // keeps finding the same record and we hot-loop in the SM, starving
+        // IDLE0 until the task WDT fires. Matches the bleprph reference flow.
+        struct ble_gap_conn_desc desc{};
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
         return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     default:
         break;
@@ -211,22 +212,22 @@ tl::expected<void, Error> start(const DeviceConfig& current)
         return tl::unexpected(Error::NimbleInit);
     }
 
-    // Opportunistic Just Works pairing: characteristics carry no _ENC flags
-    // (see gatt_settings.cpp), so reads/writes always work — but on every new
-    // connection we request pairing via ble_gap_security_initiate(). If the
-    // central agrees the link is encrypted as a bonus; if it declines or
-    // fails the setup still goes through. sm_bonding + key distribution +
-    // CONFIG_BT_NIMBLE_NVS_PERSIST=y persist the bond, so reconnecting from
-    // a previously paired host skips pairing entirely.
+    // Application-layer X25519 + AES-256-GCM (crypto.cpp) handles all
+    // confidentiality. BLE-level pairing is deliberately not used: no
+    // characteristic carries _ENC flags, we don't initiate security from
+    // the device, and bonding is disabled so a peer that voluntarily
+    // initiates pairing won't leave an LTK in NVS — without that, the
+    // SM repeat-pairing path stays dormant and can never trip the WDT loop
+    // that an earlier configuration suffered from.
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_bonding = 0;
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
-    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_our_key_dist = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
 
     // Register the standard Device Information Service alongside our settings
     // service. DIS exposes manufacturer / model / firmware revision (filled
