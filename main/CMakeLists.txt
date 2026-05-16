@@ -24,5 +24,6 @@ idf_component_register(
         esp_wifi
         esp_netif
         esp_event
+        app_update
 )
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)

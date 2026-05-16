@@ -133,6 +133,43 @@
     margin-top: 0.25rem;
   }
   .grid2 > div label { margin-top: 0.5rem; }
+  .ota-row {
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    margin: 0.4rem 0 0.6rem;
+  }
+  .ota-row input[type=file] { flex: 1; font-size: 0.85rem; }
+  #btn-ota {
+    background: #d84315; color: white;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.9rem;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #btn-ota:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ota-bar {
+    width: 100%;
+    height: 8px;
+    background: #e0e0e0;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 0.25rem;
+  }
+  .ota-bar-fill {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, #ff9800, #d84315);
+    transition: width 0.1s linear;
+  }
+  .ota-stats {
+    font-size: 0.78rem;
+    color: #666;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    margin-top: 0.3rem;
+  }
   .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; flex-wrap: wrap; }
   button {
     padding: 0.55rem 1.2rem;
@@ -284,6 +321,23 @@
     <textarea id="jtts-phrases" rows="6" placeholder="こんにちわー&#10;おはよー&#10;..."></textarea>
   </details>
 
+  <details class="jtts-section" id="ota-section">
+    <summary>ファームウェア更新 (OTA)</summary>
+    <p class="hint" style="margin-bottom:0.5rem">
+      build/stackchan_idf.bin を選んで「書き込み」を押すと、暗号化された BLE 経由で
+      新ファームを別パーティションに書き込み、再起動します。
+      成功後はブラウザ側で BLE が切断されるので、手動で再接続してください。
+    </p>
+    <div class="ota-row">
+      <input type="file" id="ota-file" accept=".bin">
+      <button id="btn-ota" type="button" disabled>書き込み</button>
+    </div>
+    <div class="ota-status" id="ota-status">
+      <div class="ota-bar"><div class="ota-bar-fill" id="ota-bar-fill"></div></div>
+      <div class="ota-stats" id="ota-stats">未開始</div>
+    </div>
+  </details>
+
   <div class="actions">
     <button id="btn-connect">BLE 接続</button>
     <button id="btn-apply" disabled>保存 &amp; 再起動</button>
@@ -310,6 +364,14 @@ const CHR_STATUS  = 'e3f0a005-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_KX      = 'e3f0a006-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_EN      = 'e3f0a007-7b1c-4d2a-9e6f-2c5a8d4b1f00';
 const CHR_JTTS    = 'e3f0a008-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_OTA_CTRL = 'e3f0a009-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+const CHR_OTA_DATA = 'e3f0a00a-7b1c-4d2a-9e6f-2c5a8d4b1f00';
+
+// OTA transfer parameters. 512B plaintext chunks fit comfortably in the
+// firmware's 1024-byte access-callback scratch buffer (after 28B of AES-GCM
+// framing) and survive the existing CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=64
+// prepared-write reassembly limit.
+const OTA_CHUNK_SIZE = 512;
 
 // Device Information Service (Bluetooth SIG-assigned, UUID 0x180A).
 // Web Bluetooth accepts the standard short names.
@@ -324,8 +386,9 @@ const DIS_CHRS = {
 
 // --- State ---
 let bleDevice = null, bleServer = null, svc = null;
-let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null, chrJtts = null;
+let chrSsid = null, chrPass = null, chrKey = null, chrApply = null, chrStatus = null, chrKx = null, chrEn = null, chrJtts = null, chrOtaCtrl = null, chrOtaData = null;
 let jttsInitialJson = '';  // last read JSON, used to detect Apply-time changes
+let otaInFlight = false;
 let aesKey = null;  // CryptoKey for AES-256-GCM, derived per connection
 
 // --- Log ---
@@ -348,6 +411,9 @@ function setBleUi(connected) {
   document.getElementById('btn-apply').disabled = !connected;
   document.getElementById('btn-disconnect').disabled = !connected;
   document.getElementById('btn-connect').disabled = connected;
+  // OTA button: only enabled when a file has been picked AND we're connected.
+  const hasFile = document.getElementById('ota-file').files.length > 0;
+  document.getElementById('btn-ota').disabled = !(connected && hasFile);
 }
 
 function updateStatus(data) {
@@ -518,6 +584,114 @@ function canonicaliseJttsForm() {
   return JSON.stringify(sorted);
 }
 
+// --- OTA over BLE ---
+// Drives the begin / chunked write / end flow, posts progress + B/s into the
+// status box. All traffic goes through the AES-GCM session.
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function setOtaProgress(received, total, rateBps) {
+  const pct = total > 0 ? Math.min(100, (received / total) * 100) : 0;
+  document.getElementById('ota-bar-fill').style.width = pct.toFixed(1) + '%';
+  const rateStr = rateBps != null ? `, ${fmtBytes(rateBps)}/s` : '';
+  document.getElementById('ota-stats').textContent =
+    `${fmtBytes(received)} / ${fmtBytes(total)} (${pct.toFixed(1)}%)${rateStr}`;
+}
+
+async function readOtaStatus() {
+  const bytes = await readEncrypted(chrOtaCtrl);
+  return JSON.parse(dec.decode(bytes));
+}
+
+async function performOta(file) {
+  if (otaInFlight) return;
+  otaInFlight = true;
+  document.getElementById('btn-ota').disabled = true;
+  document.getElementById('btn-apply').disabled = true;
+  document.getElementById('btn-disconnect').disabled = true;
+  try {
+    const total = file.size;
+    log(`OTA 開始: ${file.name} (${fmtBytes(total)})`);
+
+    // begin
+    await writeEncrypted(chrOtaCtrl, strToBytes(JSON.stringify({op: 'begin', size: total})));
+    const st = await readOtaStatus();
+    if (st.state !== 'receiving') {
+      throw new Error(`begin に失敗 (${st.state}: ${st.error || ''})`);
+    }
+    setOtaProgress(0, total, null);
+
+    // stream
+    const reader = file.stream().getReader();
+    let received = 0;
+    let pending = new Uint8Array(0);
+    const t0 = performance.now();
+    let lastProgressMs = t0;
+    let lastProgressBytes = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      // Concatenate any leftover from the previous read with this one and
+      // slice into fixed-size chunks. Sequential writeWithResponse waits for
+      // each ATT ack before the next, so this is naturally rate-limited to
+      // whatever the BLE link can sustain.
+      let buf;
+      if (pending.length === 0) {
+        buf = value;
+      } else {
+        buf = new Uint8Array(pending.length + value.length);
+        buf.set(pending, 0);
+        buf.set(value, pending.length);
+      }
+      let off = 0;
+      while (off + OTA_CHUNK_SIZE <= buf.length) {
+        await writeEncrypted(chrOtaData, buf.subarray(off, off + OTA_CHUNK_SIZE));
+        off += OTA_CHUNK_SIZE;
+        received += OTA_CHUNK_SIZE;
+        const now = performance.now();
+        if (now - lastProgressMs >= 250) {
+          const bps = ((received - lastProgressBytes) * 1000) / (now - lastProgressMs);
+          setOtaProgress(received, total, bps);
+          lastProgressMs = now;
+          lastProgressBytes = received;
+        }
+      }
+      pending = buf.subarray(off);
+    }
+    if (pending.length > 0) {
+      await writeEncrypted(chrOtaData, pending);
+      received += pending.length;
+    }
+    const elapsed = (performance.now() - t0) / 1000;
+    setOtaProgress(received, total, received / elapsed);
+    log(`データ送信完了 (${elapsed.toFixed(1)} 秒, 平均 ${fmtBytes(received / elapsed)}/s)`);
+
+    // end → server sets boot partition and schedules reboot
+    await writeEncrypted(chrOtaCtrl, strToBytes(JSON.stringify({op: 'end'})));
+    const final = await readOtaStatus();
+    if (final.state !== 'done') {
+      throw new Error(`end に失敗 (${final.state}: ${final.error || ''})`);
+    }
+    log('OTA 完了 — デバイスを再起動します。BLE が切断されたら新ファームで再接続してください。', 'ok');
+    document.getElementById('ota-stats').textContent = '再起動中…';
+  } catch (e) {
+    log(`OTA エラー: ${e.message}`, 'err');
+    try {
+      await writeEncrypted(chrOtaCtrl, strToBytes(JSON.stringify({op: 'abort'})));
+    } catch (_) { /* ignore — link may be down */ }
+    document.getElementById('ota-stats').textContent = `失敗: ${e.message}`;
+    document.getElementById('btn-ota').disabled = false;
+    document.getElementById('btn-apply').disabled = false;
+    document.getElementById('btn-disconnect').disabled = false;
+  } finally {
+    otaInFlight = false;
+  }
+}
+
 // Encrypt a payload and write it. Same wire format.
 async function writeEncrypted(chr, plainBytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -558,7 +732,7 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     log('GATT 接続完了', 'ok');
 
     svc = await bleServer.getPrimaryService(SVC_UUID);
-    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn, chrJtts] = await Promise.all([
+    [chrSsid, chrPass, chrKey, chrApply, chrStatus, chrKx, chrEn, chrJtts, chrOtaCtrl, chrOtaData] = await Promise.all([
       svc.getCharacteristic(CHR_SSID),
       svc.getCharacteristic(CHR_PASS),
       svc.getCharacteristic(CHR_KEY),
@@ -567,6 +741,8 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
       svc.getCharacteristic(CHR_KX),
       svc.getCharacteristic(CHR_EN),
       svc.getCharacteristic(CHR_JTTS),
+      svc.getCharacteristic(CHR_OTA_CTRL),
+      svc.getCharacteristic(CHR_OTA_DATA),
     ]);
     log('Characteristics 取得完了', 'ok');
 
@@ -654,12 +830,18 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
 function onDisconnected() {
   log('切断されました', 'err');
   setBleUi(false);
-  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = chrJtts = null;
+  chrSsid = chrPass = chrKey = chrApply = chrStatus = chrKx = chrEn = chrJtts = chrOtaCtrl = chrOtaData = null;
   aesKey = null;
   clearDeviceInfo();
   delete document.getElementById('openai-enabled').dataset.initial;
   jttsInitialJson = '';
   writeJttsForm('');
+  document.getElementById('btn-ota').disabled = true;
+  if (!otaInFlight) {
+    document.getElementById('ota-bar-fill').style.width = '0';
+    document.getElementById('ota-stats').textContent = '未開始';
+    document.getElementById('ota-file').value = '';
+  }
 }
 
 // --- Manual disconnect ---
@@ -731,6 +913,21 @@ document.getElementById('btn-apply').addEventListener('click', async () => {
       btn.textContent = '保存 & 再起動';
     }
   }
+});
+
+// --- OTA controls ---
+document.getElementById('ota-file').addEventListener('change', e => {
+  const file = e.target.files && e.target.files[0];
+  document.getElementById('btn-ota').disabled = !file || !chrOtaCtrl;
+  if (file) {
+    document.getElementById('ota-stats').textContent = `${file.name} (${fmtBytes(file.size)})`;
+  }
+});
+document.getElementById('btn-ota').addEventListener('click', () => {
+  const file = document.getElementById('ota-file').files[0];
+  if (!file) return;
+  if (!confirm(`新ファーム ${file.name} (${fmtBytes(file.size)}) を書き込みます。よろしいですか？`)) return;
+  performOta(file);
 });
 </script>
 </body>

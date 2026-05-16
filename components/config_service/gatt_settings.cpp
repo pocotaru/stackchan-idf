@@ -4,6 +4,7 @@
 #include "gatt_settings.hpp"
 #include "config_store.hpp"
 #include "crypto.hpp"
+#include "ota.hpp"
 
 #include <array>
 #include <cstdint>
@@ -38,6 +39,7 @@ constexpr const char* kTag = "cfg-gatt";
 // SSID:    e3f0a001-...  Pass: e3f0a002-...  Key: e3f0a003-...
 // Apply:   e3f0a004-...  Status: e3f0a005-...  KeyExchange: e3f0a006-...
 // OpenAiEnabled: e3f0a007-...  JttsConfig: e3f0a008-...
+// OtaControl: e3f0a009-...  OtaData: e3f0a00a-...
 
 static const ble_uuid128_t kSvcUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
@@ -74,6 +76,16 @@ static const ble_uuid128_t kOpenAiEnabledUuid = BLE_UUID128_INIT(
 static const ble_uuid128_t kJttsConfigUuid = BLE_UUID128_INIT(
     0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
     0x2a, 0x4d, 0x1c, 0x7b, 0x08, 0xa0, 0xf0, 0xe3);
+// OtaControl — encrypted JSON command channel for OTA flashing.
+// READ returns the current status JSON, WRITE accepts begin/end/abort.
+static const ble_uuid128_t kOtaControlUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x09, 0xa0, 0xf0, 0xe3);
+// OtaData — encrypted WRITE-only firmware chunk channel. Each write is one
+// 512-byte plaintext slice of the new image, applied sequentially.
+static const ble_uuid128_t kOtaDataUuid = BLE_UUID128_INIT(
+    0x00, 0x1f, 0x4b, 0x8d, 0x5a, 0x2c, 0x6f, 0x9e,
+    0x2a, 0x4d, 0x1c, 0x7b, 0x0a, 0xa0, 0xf0, 0xe3);
 
 // --- Mutable state guarded by g_mutex ---
 static SemaphoreHandle_t g_mutex = nullptr;
@@ -98,6 +110,8 @@ static uint16_t g_status_handle = 0;
 static uint16_t g_kx_handle = 0;
 static uint16_t g_enabled_handle = 0;
 static uint16_t g_jtts_handle = 0;
+static uint16_t g_ota_ctrl_handle = 0;
+static uint16_t g_ota_data_handle = 0;
 
 // Largest plaintext payload we accept on a single write — chosen to fit the
 // jtts config JSON comfortably. The encrypted wire form adds 12 (nonce) + 16
@@ -105,6 +119,11 @@ static uint16_t g_jtts_handle = 0;
 // reassembles prepared writes into a single mbuf chain that ble_hs_mbuf_to_flat
 // then drops into our buffer.
 constexpr std::size_t kMaxJttsConfigBytes = 768;
+
+// OTA firmware chunks are sent in 512-byte plaintext slices (~540 bytes on the
+// wire after AES-GCM framing). Comfortably under the 996-byte plaintext cap
+// implied by the 1024-byte access-cb scratch buffer.
+constexpr std::size_t kMaxOtaChunkBytes = 768;
 
 // Per-connection application-layer crypto session. Reset on disconnect by
 // config_service.cpp so the next central re-runs the X25519 handshake.
@@ -208,6 +227,19 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             xSemaphoreGive(g_mutex);
             return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
         }
+        if (attr_handle == g_ota_ctrl_handle) {
+            xSemaphoreTake(g_mutex, portMAX_DELAY);
+            if (!g_session.is_established()) {
+                xSemaphoreGive(g_mutex);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            const std::string json = ota::status_json();
+            const bool ok = append_encrypted(
+                ctxt->om,
+                {reinterpret_cast<const std::uint8_t*>(json.data()), json.size()});
+            xSemaphoreGive(g_mutex);
+            return ok ? 0 : BLE_ATT_ERR_UNLIKELY;
+        }
         return BLE_ATT_ERR_ATTR_NOT_FOUND;
     }
 
@@ -290,6 +322,20 @@ static int gatt_access_cb(uint16_t /*conn_handle*/, uint16_t attr_handle,
             xSemaphoreTake(g_mutex, portMAX_DELAY);
             g_staging.jtts_config = std::move(val);
             xSemaphoreGive(g_mutex);
+            return 0;
+        }
+        if (attr_handle == g_ota_ctrl_handle) {
+            // JSON command (begin/end/abort). Result is observable via the
+            // next READ on this characteristic (returns ota::status_json()).
+            if (pt.size() > kMaxJttsConfigBytes) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            std::string cmd(reinterpret_cast<const char*>(pt.data()), pt.size());
+            (void)ota::handle_control_command(cmd);
+            return 0;
+        }
+        if (attr_handle == g_ota_data_handle) {
+            // Raw firmware chunk; passed straight to esp_ota_write.
+            if (pt.size() > kMaxOtaChunkBytes) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            (void)ota::handle_data_chunk({pt.data(), pt.size()});
             return 0;
         }
         if (attr_handle == g_apply_handle) {
@@ -387,6 +433,18 @@ static ble_gatt_chr_def kChrs[] = {
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
         .val_handle = &g_jtts_handle,
     },
+    {
+        .uuid = &kOtaControlUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_ota_ctrl_handle,
+    },
+    {
+        .uuid = &kOtaDataUuid.u,
+        .access_cb = gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_WRITE,
+        .val_handle = &g_ota_data_handle,
+    },
     {} // terminator: uuid = nullptr
 };
 
@@ -469,6 +527,9 @@ void reset_session()
 {
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_session.reset();
+    // Any half-finished OTA must not survive a disconnect — esp_ota_abort
+    // releases the partition so the bootloader keeps running the old image.
+    ota::abort();
     xSemaphoreGive(g_mutex);
 }
 

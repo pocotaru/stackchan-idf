@@ -14,6 +14,7 @@
 #include <freertos/task.h>
 
 #include <nvs_flash.h>
+#include <esp_ota_ops.h>
 
 #include "avatar/expression.hpp"
 #include "board/board.hpp"
@@ -274,6 +275,13 @@ void demo_loop(const std::string& jtts_config_json)
 
 extern "C" void app_main()
 {
+    // Confirm the running image so the bootloader doesn't roll back on the
+    // next reboot. CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y leaves freshly-OTA'd
+    // images in PENDING_VERIFY until this call promotes them to VALID. We do
+    // it unconditionally — for boot from the original factory partition it's
+    // a no-op, for boot after an OTA it locks in the new firmware.
+    esp_ota_mark_app_valid_cancel_rollback();
+
     auto board_result = stackchan::board::Board::begin();
     if (!board_result) {
         ESP_LOGE(kTag, "Board::begin() failed: %d", static_cast<int>(board_result.error()));
