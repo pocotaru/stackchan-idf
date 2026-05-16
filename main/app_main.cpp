@@ -15,6 +15,7 @@
 
 #include <nvs_flash.h>
 #include <esp_ota_ops.h>
+#include <esp_heap_caps.h>
 
 #include "avatar/expression.hpp"
 #include "board/board.hpp"
@@ -273,6 +274,27 @@ void demo_loop(const std::string& jtts_config_json)
 
 } // namespace
 
+// Temporary heap monitor — periodic snapshot of internal/PSRAM free + the
+// largest contiguous block. Useful while chasing slow leaks or fragmentation
+// that surface as mbedtls handshake failures ("esp-aes: Failed to allocate
+// memory"). Cheap to run; remove once the audio-tx refactor is settled.
+[[maybe_unused]] static void heap_monitor_task(void* /*arg*/)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        const std::size_t int_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const std::size_t int_big   = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        const std::size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const std::size_t psram_big  = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        const std::size_t int_min   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+        const std::size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI("heap",
+                 "INT free=%u (largest=%u, min=%u)  PSRAM free=%u (largest=%u, min=%u)",
+                 static_cast<unsigned>(int_free), static_cast<unsigned>(int_big), static_cast<unsigned>(int_min),
+                 static_cast<unsigned>(psram_free), static_cast<unsigned>(psram_big), static_cast<unsigned>(psram_min));
+    }
+}
+
 extern "C" void app_main()
 {
     // Confirm the running image so the bootloader doesn't roll back on the
@@ -281,6 +303,8 @@ extern "C" void app_main()
     // it unconditionally — for boot from the original factory partition it's
     // a no-op, for boot after an OTA it locks in the new firmware.
     esp_ota_mark_app_valid_cancel_rollback();
+
+    xTaskCreatePinnedToCore(heap_monitor_task, "heap_mon", 3072, nullptr, 1, nullptr, 1);
 
     auto board_result = stackchan::board::Board::begin();
     if (!board_result) {

@@ -48,3 +48,13 @@ CONFIG_MBEDTLS_HKDF_C=y
 # what the bleprph OTA examples use and gives a comfortable margin.
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 CONFIG_BT_NIMBLE_TASK_STACK_SIZE=8192
+
+# Push memory-hungry users to PSRAM. The OpenAI Realtime conversation pulls a
+# 24 kHz pcm16 stream through a TLS WebSocket; with mbedtls keeping its
+# handshake / record buffers in internal RAM by default the device sat at
+# ~67 B of internal heap during peak, which made the next handshake's RSA /
+# AES allocations fail at random. The three switches below let the wifi /
+# lwIP / mbedtls layers fall back to PSRAM for the large transient buffers.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

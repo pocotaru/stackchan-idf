@@ -13,9 +13,12 @@
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_websocket_client.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include <esp_heap_caps.h>
 
 #include "base64.hpp"
@@ -34,13 +37,35 @@ constexpr const char* kRealtimeUriPrefix = "wss://api.openai.com/v1/realtime?mod
 // leaves generous headroom so the append path never allocates.
 constexpr std::size_t kMaxChunkSamples = 2048;
 
-// Wi-Fi RTT is normally <100 ms, but bursts of latency or AP roaming can push
-// individual writes past several seconds. With the old 500 ms cap, a single
-// blip during a 40-ms mic chunk's send would fail transport_poll_write and
-// tear down the whole WebSocket — so the conversation would reconnect mid-
-// sentence every time the network burped. 3 s tolerates the typical worst
-// case without making the audio path feel laggy when things are healthy.
-constexpr TickType_t kSendTimeout = pdMS_TO_TICKS(3000);
+// Per-send timeout for the WS write inside the sender task. The mic loop no
+// longer blocks on this — it enqueues into the audio tx ring and returns
+// immediately, so a long write here just delays the sender, not capture.
+// esp_websocket_client unconditionally aborts the connection on a send that
+// returns 0 bytes (its `poll_write` timed out), so this is effectively our
+// "give up and reconnect" threshold. Generous enough that a brief BLE-coex
+// or Wi-Fi DTIM stall doesn't tear the session down.
+constexpr TickType_t kSendTimeout = pdMS_TO_TICKS(10000);
+
+// Background sender task: drains audio_tx_queue_, encodes each chunk to
+// base64+JSON, calls esp_websocket_client_send_text. Pinned to core 1 so it
+// doesn't fight with the conv-task / render-task pair on core 0.
+constexpr UBaseType_t kSenderTaskPrio = 5;
+constexpr std::size_t kSenderTaskStack = 6144;
+constexpr BaseType_t kSenderTaskCore = 1;
+
+// Capacity (chunks) of the audio tx ring buffer between push_audio() and the
+// sender. At 40 ms mic chunks this is 96 * 40 ms = ~3.8 s of audio. Lets the
+// sender pause for that long during a network hiccup before we start
+// dropping the oldest chunks. Each chunk is 1920 bytes raw PCM allocated in
+// PSRAM, so worst-case ~184 KiB sitting in the heap.
+constexpr std::size_t kAudioTxQueueLen = 96;
+
+// Per-chunk PCM payload, allocated in PSRAM. The trailing flexible array
+// avoids a second heap allocation per chunk.
+struct AudioChunk {
+    std::uint16_t len_samples;
+    std::int16_t data[];  // [len_samples]
+};
 
 // OpenAI Realtime only offers pcm16 at 24 kHz or G.711 at 8 kHz, so the
 // requested output sample rate uniquely selects the wire codec.
@@ -82,8 +107,14 @@ public:
         rx_op_code_ = 0;
 
         const std::size_t b64_cap = base64::encoded_size(kMaxChunkSamples * sizeof(std::int16_t));
-        b64_scratch_.assign(b64_cap, '\0');
-        json_scratch_.assign(b64_cap + 128, '\0');
+        b64_scratch_ = static_cast<char*>(heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        json_scratch_ = static_cast<char*>(heap_caps_malloc(b64_cap + 128, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (b64_scratch_ == nullptr || json_scratch_ == nullptr) {
+            teardown();
+            return tl::unexpected{ConversationError::OutOfMemory};
+        }
+        b64_capacity_ = b64_cap;
+        json_capacity_ = b64_cap + 128;
 
         const std::string uri = std::string{kRealtimeUriPrefix} + config_.model;
 
@@ -125,7 +156,28 @@ public:
 
         session_updated_ = false;
         pending_tool_call_ = false;
+        audio_seq_ = 0;
         set_state(ConversationState::Connecting);
+
+        // Spin up the audio sender pipeline. Has to be ready before the
+        // first push_audio() call from conv-task, which fires within a few
+        // ms of WEBSOCKET_EVENT_CONNECTED.
+        audio_tx_queue_ = xQueueCreate(kAudioTxQueueLen, sizeof(AudioChunk*));
+        if (audio_tx_queue_ == nullptr) {
+            teardown();
+            return tl::unexpected{ConversationError::OutOfMemory};
+        }
+        sender_should_exit_.store(false, std::memory_order_relaxed);
+        // Allocate the sender's 6 KiB stack from PSRAM via WithCaps — keeps
+        // internal RAM available for mbedtls's transient RSA / AES contexts
+        // during TLS handshake (those can be 8-16 KiB each).
+        if (xTaskCreatePinnedToCoreWithCaps(&Impl::sender_trampoline, "rt_audio_tx",
+                                            kSenderTaskStack, this, kSenderTaskPrio,
+                                            &sender_task_, kSenderTaskCore,
+                                            MALLOC_CAP_SPIRAM) != pdPASS) {
+            teardown();
+            return tl::unexpected{ConversationError::TransportInit};
+        }
 
         if (esp_websocket_client_start(client_) != ESP_OK) {
             teardown();
@@ -147,33 +199,38 @@ public:
         if (pcm.empty()) {
             return {};
         }
-
-        std::lock_guard lock{send_mutex_};
-        if (client_ == nullptr || !esp_websocket_client_is_connected(client_)) {
+        if (audio_tx_queue_ == nullptr) {
             return tl::unexpected{ConversationError::NotConnected};
         }
 
-        const auto bytes = std::as_bytes(pcm);
-        const std::span<const std::uint8_t> raw{reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()};
+        // Allocate the chunk in PSRAM and copy the PCM samples. Keeping the
+        // bytes out of internal RAM matters because the queue can hold a few
+        // seconds of audio during a network stall (~184 KiB worst case).
+        const std::size_t alloc =
+            sizeof(AudioChunk) + pcm.size() * sizeof(std::int16_t);
+        auto* chunk = static_cast<AudioChunk*>(
+            heap_caps_malloc(alloc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (chunk == nullptr) {
+            return tl::unexpected{ConversationError::OutOfMemory};
+        }
+        chunk->len_samples = static_cast<std::uint16_t>(pcm.size());
+        std::memcpy(chunk->data, pcm.data(), pcm.size() * sizeof(std::int16_t));
 
-        // Hot path: encode + JSON-wrap into preallocated scratch, no heap.
-        const std::size_t needed_b64 = base64::encoded_size(raw.size());
-        if (needed_b64 > b64_scratch_.size()) {
-            b64_scratch_.assign(needed_b64, '\0');
-            json_scratch_.assign(needed_b64 + 128, '\0');
-        }
-        auto enc = base64::encode_into(raw, b64_scratch_);
-        if (!enc) {
-            return tl::unexpected{enc.error()};
-        }
-        const int n = std::snprintf(json_scratch_.data(), json_scratch_.size(),
-                                    "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%.*s\"}",
-                                    static_cast<int>(*enc), b64_scratch_.data());
-        if (n <= 0 || static_cast<std::size_t>(n) >= json_scratch_.size()) {
-            return tl::unexpected{ConversationError::SendFailed};
-        }
-        if (esp_websocket_client_send_text(client_, json_scratch_.data(), n, kSendTimeout) < 0) {
-            return tl::unexpected{ConversationError::SendFailed};
+        // Non-blocking enqueue. If the sender is stuck (network hiccup) and
+        // the ring is full, drop the OLDEST chunk to keep the audio fresh —
+        // realtime voice gets less useful with every second of latency. Mic
+        // capture continues uninterrupted either way.
+        if (xQueueSend(audio_tx_queue_, &chunk, 0) != pdTRUE) {
+            AudioChunk* old = nullptr;
+            if (xQueueReceive(audio_tx_queue_, &old, 0) == pdTRUE && old != nullptr) {
+                heap_caps_free(old);
+            }
+            if (xQueueSend(audio_tx_queue_, &chunk, 0) != pdTRUE) {
+                heap_caps_free(chunk);
+                ESP_LOGW(kTag, "audio tx queue stuck; dropping chunk");
+                return tl::unexpected{ConversationError::SendFailed};
+            }
+            ESP_LOGW(kTag, "audio tx queue full; evicted oldest chunk");
         }
         return {};
     }
@@ -245,6 +302,29 @@ private:
 
     void teardown()
     {
+        // Stop the sender first so it can't issue more writes against a
+        // client we're about to destroy. Push a nullptr sentinel to unblock
+        // a sender waiting on xQueueReceive.
+        if (sender_task_ != nullptr) {
+            sender_should_exit_.store(true, std::memory_order_release);
+            AudioChunk* sentinel = nullptr;
+            xQueueSend(audio_tx_queue_, &sentinel, 0);
+            // Sender will self-delete; poll briefly for it to exit.
+            for (int i = 0; i < 200; ++i) {
+                if (eTaskGetState(sender_task_) == eDeleted) break;
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            sender_task_ = nullptr;
+        }
+        if (audio_tx_queue_ != nullptr) {
+            AudioChunk* chunk = nullptr;
+            while (xQueueReceive(audio_tx_queue_, &chunk, 0) == pdTRUE) {
+                if (chunk != nullptr) heap_caps_free(chunk);
+            }
+            vQueueDelete(audio_tx_queue_);
+            audio_tx_queue_ = nullptr;
+        }
+
         if (client_ != nullptr) {
             esp_websocket_client_stop(client_);
             esp_websocket_client_destroy(client_);
@@ -254,9 +334,104 @@ private:
             heap_caps_free(rx_buffer_);
             rx_buffer_ = nullptr;
         }
+        if (b64_scratch_ != nullptr) {
+            heap_caps_free(b64_scratch_);
+            b64_scratch_ = nullptr;
+        }
+        if (json_scratch_ != nullptr) {
+            heap_caps_free(json_scratch_);
+            json_scratch_ = nullptr;
+        }
+        b64_capacity_ = 0;
+        json_capacity_ = 0;
         rx_capacity_ = 0;
         rx_len_ = 0;
         set_state(ConversationState::Idle);
+    }
+
+    // ---- audio sender task -------------------------------------------------
+
+    static void sender_trampoline(void* arg)
+    {
+        static_cast<Impl*>(arg)->sender_loop();
+        // Matches xTaskCreatePinnedToCoreWithCaps: frees the PSRAM-resident
+        // stack as well as the TCB.
+        vTaskDeleteWithCaps(nullptr);
+    }
+
+    void sender_loop()
+    {
+        AudioChunk* chunk = nullptr;
+        while (!sender_should_exit_.load(std::memory_order_acquire)) {
+            // Block with a small cap so we wake periodically to re-check the
+            // exit flag even if the queue is idle.
+            if (xQueueReceive(audio_tx_queue_, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+                continue;
+            }
+            if (chunk == nullptr) {
+                break; // teardown sentinel
+            }
+            send_one_chunk(chunk);
+            heap_caps_free(chunk);
+            chunk = nullptr;
+        }
+    }
+
+    // Encode + send a single chunk. Failures (WS aborted, encode error) are
+    // logged but otherwise eaten — the WS event handler will surface the
+    // disconnect through the normal Error path and conv-task drives the
+    // reconnect. The mic side keeps producing in the meantime; the next
+    // teardown will flush whatever is left in the queue.
+    void send_one_chunk(AudioChunk* chunk)
+    {
+        if (client_ == nullptr) return;
+        if (!esp_websocket_client_is_connected(client_)) return;
+
+        const auto* raw_ptr = reinterpret_cast<const std::uint8_t*>(chunk->data);
+        const std::size_t raw_len =
+            static_cast<std::size_t>(chunk->len_samples) * sizeof(std::int16_t);
+        const std::size_t needed_b64 = base64::encoded_size(raw_len);
+        if (needed_b64 > b64_capacity_) {
+            // Shouldn't happen — start() pre-sizes for the largest chunk —
+            // but skip rather than try to grow on the hot path.
+            return;
+        }
+        auto enc = base64::encode_into({raw_ptr, raw_len}, {b64_scratch_, b64_capacity_});
+        if (!enc) {
+            return;
+        }
+        const int n = std::snprintf(json_scratch_, json_capacity_,
+                                    "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%.*s\"}",
+                                    static_cast<int>(*enc), b64_scratch_);
+        if (n <= 0 || static_cast<std::size_t>(n) >= json_capacity_) {
+            return;
+        }
+
+        const std::uint32_t t0 =
+            static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
+        int send_rc;
+        {
+            std::lock_guard lock{send_mutex_};
+            send_rc = esp_websocket_client_send_text(client_, json_scratch_, n, kSendTimeout);
+        }
+        const std::uint32_t dt =
+            static_cast<std::uint32_t>(esp_timer_get_time() / 1000) - t0;
+        ++audio_seq_;
+        if (send_rc <= 0) {
+            // esp_websocket_client already called abort_connection() — the
+            // DISCONNECTED event will fire and conv-task reconnects. We log
+            // for visibility but don't propagate.
+            ESP_LOGW(kTag, "audio send failed seq=%lu dt=%lums size=%dB rc=%d",
+                     static_cast<unsigned long>(audio_seq_),
+                     static_cast<unsigned long>(dt), n, send_rc);
+        } else if (dt >= 100 || (audio_seq_ % 100) == 1) {
+            // Light periodic / slow-send heartbeat.
+            const UBaseType_t queued = uxQueueMessagesWaiting(audio_tx_queue_);
+            ESP_LOGI(kTag, "audio send seq=%lu dt=%lums queued=%u",
+                     static_cast<unsigned long>(audio_seq_),
+                     static_cast<unsigned long>(dt),
+                     static_cast<unsigned>(queued));
+        }
     }
 
     void set_state(ConversationState s)
@@ -626,6 +801,8 @@ private:
     std::mutex send_mutex_;
 
     bool session_updated_{false};
+    // TEMP: per-chunk sequence counter for the push_audio diagnostic log.
+    std::uint32_t audio_seq_{0};
     bool pending_tool_call_{false};
     bool output_is_ulaw_{false};            // wire codec for assistant audio (g711_ulaw vs pcm16)
     std::atomic<bool> response_active_{false}; // a response is mid-generation (set/cleared from the WS task)
@@ -636,9 +813,21 @@ private:
     std::size_t rx_len_{0};
     std::uint8_t rx_op_code_{0};
 
-    // Hot-path scratch for input_audio_buffer.append.
-    std::vector<char> b64_scratch_;
-    std::vector<char> json_scratch_;
+    // Hot-path scratch for input_audio_buffer.append. PSRAM-resident so the
+    // ~6 KiB combined doesn't eat the internal-RAM budget that mbedtls needs
+    // for handshake-time allocations. Only the sender task reads/writes these
+    // (push_audio just memcpys into PSRAM-allocated chunks now), so no extra
+    // locking beyond send_mutex_ is needed for the WS call.
+    char* b64_scratch_{nullptr};
+    std::size_t b64_capacity_{0};
+    char* json_scratch_{nullptr};
+    std::size_t json_capacity_{0};
+
+    // Audio tx pipeline: push_audio() enqueues PSRAM-resident AudioChunks
+    // here, sender_loop() drains them and feeds esp_websocket_client_send_text.
+    QueueHandle_t audio_tx_queue_{nullptr};
+    TaskHandle_t sender_task_{nullptr};
+    std::atomic<bool> sender_should_exit_{false};
 
     // Function-call argument accumulation, keyed by call_id.
     std::unordered_map<std::string, std::string> fn_args_;
