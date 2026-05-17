@@ -1,0 +1,152 @@
+name: Build and Release Firmware
+
+# Tag-driven release: push `vX.Y.Z` to build the firmware in the official
+# ESP-IDF container and attach the artifacts to a GitHub Release. Manual
+# dispatch is supported too for smoke-testing the CI without cutting a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Firmware
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0  # full history so `git describe --tags` resolves
+
+      - name: Verify git version information
+        shell: bash
+        run: |
+          # Container's git refuses operations in a workspace it doesn't own;
+          # mark it safe before any git command.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "=== Git Information ==="
+          git describe --tags --abbrev=0 || echo "(no tags found)"
+          git rev-parse --short HEAD
+          git diff-index --quiet HEAD -- && echo "Working tree clean" || echo "Working tree dirty"
+          echo "Current ref: ${GITHUB_REF}"
+
+      - name: Apply M5Unified patches
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/components/M5Unified"
+          tools/apply-m5-patches.sh
+
+      - name: Build firmware
+        shell: bash
+        env:
+          CI: true
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: Generate single firmware image
+        run: |
+          python3 script/pack_firmware.py
+          ls -lh firmware.bin
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="dev-${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "Build date: $BUILD_DATE"
+
+      - name: Prepare release artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          cp build/bootloader/bootloader.bin              release/
+          cp build/partition_table/partition-table.bin    release/
+          cp build/ota_data_initial.bin                   release/
+          cp build/stackchan_idf.bin                      release/
+          cp firmware.bin release/firmware-${{ steps.version.outputs.version }}.bin
+          cp build/flash_args release/
+          cp README.md release/ 2>/dev/null || true
+
+          echo "=== Firmware Size Information ==="
+          python3 -m esp_idf_size build/stackchan_idf.map --format=text || true
+
+          ls -lh release/
+
+      - name: Create firmware ZIP
+        shell: bash
+        run: |
+          cd release
+          zip -r ../firmware-${{ steps.version.outputs.version }}.zip .
+          cd ..
+          ls -lh firmware-${{ steps.version.outputs.version }}.zip
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.version.outputs.version }}
+          path: release/
+          retention-days: 90
+
+      - name: Create Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: firmware-${{ steps.version.outputs.version }}.zip
+          body: |
+            # Stack-chan Firmware ${{ steps.version.outputs.version }}
+
+            M5Stack CoreS3 向けスタックチャン ファームウェア。
+
+            ## Features
+            - **OpenAI Realtime API / Google Gemini Live API** どちらかでリアルタイム音声会話
+            - **BLE 経由の設定 / プロビジョニング** (X25519 + AES-256-GCM 暗号化セッション)
+            - **BLE OTA アップデート**(再ビルド不要で次回からはブラウザから直接書き込み)
+            - **jtts ボイス カスタマイズ**(声・フレーズを設定画面から変更)
+            - **タッチセンサによる barge-in / なでなで応答**
+
+            ## Installation
+
+            ### Web Flasher (Chrome / Edge)
+            <https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/>
+            にアクセスして本リリースを選択し、Stack-chan を USB 接続後に書き込みボタンを押してください。
+
+            ### コマンドラインから初回書き込み
+            1. 下の `firmware-${{ steps.version.outputs.version }}.zip` をダウンロード・展開
+            2. esptool で書き込み:
+               ```bash
+               esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash \
+                 0x0 firmware-${{ steps.version.outputs.version }}.bin
+               ```
+
+            ### BLE 経由の OTA(既に動いている場合)
+            1. <https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/settings.html>
+            2. BLE 接続後「ファームウェア更新 (OTA)」を開き、ZIP に同梱の
+               `stackchan_idf.bin` を選択 → 書き込み
+
+            ## Build Information
+            - **ESP-IDF**: release-v6.0
+            - **Target**: ESP32-S3
+            - **Build Date**: ${{ steps.version.outputs.build_date }}
+            - **Commit**: ${{ github.sha }}
+
+            ## Full Changelog
+            https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
