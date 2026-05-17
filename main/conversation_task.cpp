@@ -36,12 +36,14 @@ namespace conv = stackchan::conversation;
 
 constexpr const char* kTag = "conv-task";
 
-// Audio rates. Mic uplink stays pcm16 @ 24 kHz; the assistant reply comes back
-// as G.711 µ-law @ 8 kHz (the OpenAI client decodes µ-law -> PCM16 internally,
-// so this task always sees PCM16 — just at 8 kHz for playback).
-constexpr std::uint32_t kMicSampleRate = 24000;
+// Audio rates. Both directions use G.711 µ-law @ 8 kHz — symmetric, and 6×
+// lighter on the BLE-coex-stressed Wi-Fi uplink than PCM16 @ 24 kHz. The
+// OpenAI client encodes mic samples to µ-law inside push_audio (PCM16 stays
+// in M5.Mic's buffers and on this task's stack only) and decodes the reply
+// back to PCM16 for M5.Speaker.
+constexpr std::uint32_t kMicSampleRate = 8000;
 constexpr std::uint32_t kSpeakerSampleRate = 8000;
-constexpr std::size_t kMicChunkSamples = 960;  // 40 ms per mic chunk
+constexpr std::size_t kMicChunkSamples = 320;  // 40 ms per mic chunk @ 8 kHz
 constexpr std::uint32_t kEnvelopeStepMs = 16;
 
 // Playback ring: M5.Speaker.playRaw references the buffer (no copy) and its

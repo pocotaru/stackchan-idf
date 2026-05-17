@@ -33,10 +33,10 @@ constexpr const char* kTag = "openai-rt";
 // wss host + path. The model is appended as a query parameter.
 constexpr const char* kRealtimeUriPrefix = "wss://api.openai.com/v1/realtime?model=";
 
-// Hot-path scratch is sized for this many PCM16 samples per push_audio chunk.
-// The coordinator streams ~20-40 ms chunks (480-960 samples at 24 kHz); 2048
-// leaves generous headroom so the append path never allocates.
-constexpr std::size_t kMaxChunkSamples = 2048;
+// Hot-path scratch sized for this many wire bytes per push_audio chunk.
+// At 8 kHz µ-law a 40 ms chunk is 320 bytes; 1024 leaves headroom for any
+// future change without re-sizing on the hot path.
+constexpr std::size_t kMaxChunkBytes = 1024;
 
 // Per-send timeout for the WS write inside the sender task. The mic loop no
 // longer blocks on this — it enqueues into the audio tx ring and returns
@@ -55,17 +55,17 @@ constexpr std::size_t kSenderTaskStack = 6144;
 constexpr BaseType_t kSenderTaskCore = 1;
 
 // Capacity (chunks) of the audio tx ring buffer between push_audio() and the
-// sender. At 40 ms mic chunks this is 96 * 40 ms = ~3.8 s of audio. Lets the
-// sender pause for that long during a network hiccup before we start
-// dropping the oldest chunks. Each chunk is 1920 bytes raw PCM allocated in
-// PSRAM, so worst-case ~184 KiB sitting in the heap.
+// sender. At 40 ms mic chunks (= 320 µ-law bytes each at 8 kHz) this is 96
+// slots * 40 ms = ~3.8 s of audio. Lets the sender pause for that long
+// during a network hiccup before the oldest chunks start being evicted.
+// Each chunk is ~320 B μ-law allocated in PSRAM, so worst-case ~31 KiB.
 constexpr std::size_t kAudioTxQueueLen = 96;
 
-// Per-chunk PCM payload, allocated in PSRAM. The trailing flexible array
-// avoids a second heap allocation per chunk.
+// Per-chunk wire payload (µ-law bytes), allocated in PSRAM. The trailing
+// flexible array avoids a second heap allocation per chunk.
 struct AudioChunk {
-    std::uint16_t len_samples;
-    std::int16_t data[];  // [len_samples]
+    std::uint16_t len_bytes;
+    std::uint8_t data[];  // [len_bytes] G.711 µ-law samples
 };
 
 // OpenAI Realtime only offers pcm16 at 24 kHz or G.711 at 8 kHz, so the
@@ -80,6 +80,28 @@ std::int16_t ulaw_to_pcm16(std::uint8_t u_val)
     std::int32_t t = ((u_val & 0x0F) << 3) + 0x84;
     t <<= (u_val & 0x70) >> 4;
     return static_cast<std::int16_t>((u_val & 0x80) ? (0x84 - t) : (t - 0x84));
+}
+
+// Standard G.711 µ-law encode (Sun algorithm). 16-bit PCM in, one companded
+// byte out. Used to shrink the mic uplink from PCM16 @ 24 kHz (~65 KB/s
+// JSON+base64) down to PCM_MU @ 8 kHz (~11 KB/s) so coex hiccups don't
+// build up enough backlog to evict the audio tx ring.
+std::uint8_t pcm16_to_ulaw(std::int16_t pcm)
+{
+    constexpr int kBias = 0x84;
+    constexpr int kClip = 32635;
+    std::uint8_t sign = (pcm < 0) ? 0x80 : 0x00;
+    int mag = sign ? -static_cast<int>(pcm) : static_cast<int>(pcm);
+    if (mag > kClip) mag = kClip;
+    mag += kBias;
+    int seg = 7;
+    int test = 0x4000;
+    while ((mag & test) == 0 && seg > 0) {
+        test >>= 1;
+        --seg;
+    }
+    const int mantissa = (mag >> (seg + 3)) & 0x0F;
+    return static_cast<std::uint8_t>(~(sign | (seg << 4) | mantissa));
 }
 
 } // namespace
@@ -107,7 +129,7 @@ public:
         rx_len_ = 0;
         rx_op_code_ = 0;
 
-        const std::size_t b64_cap = base64::encoded_size(kMaxChunkSamples * sizeof(std::int16_t));
+        const std::size_t b64_cap = base64::encoded_size(kMaxChunkBytes);
         b64_scratch_.assign(b64_cap, '\0');
         json_scratch_.assign(b64_cap + 128, '\0');
 
@@ -198,18 +220,22 @@ public:
             return tl::unexpected{ConversationError::NotConnected};
         }
 
-        // Allocate the chunk in PSRAM and copy the PCM samples. Keeping the
-        // bytes out of internal RAM matters because the queue can hold a few
-        // seconds of audio during a network stall (~184 KiB worst case).
-        const std::size_t alloc =
-            sizeof(AudioChunk) + pcm.size() * sizeof(std::int16_t);
+        // Encode PCM16 → G.711 µ-law into a PSRAM-resident chunk. The wire
+        // form is one byte per sample (vs two for raw PCM16) and OpenAI
+        // Realtime input is fixed at 8 kHz for pcmu — the caller supplies
+        // mic samples at 8 kHz already (see kMicSampleRate in conv-task).
+        // Keeping the chunks in PSRAM matters because the queue can hold a
+        // few seconds of audio during a network stall.
+        const std::size_t alloc = sizeof(AudioChunk) + pcm.size();
         auto* chunk = static_cast<AudioChunk*>(
             heap_caps_malloc(alloc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (chunk == nullptr) {
             return tl::unexpected{ConversationError::OutOfMemory};
         }
-        chunk->len_samples = static_cast<std::uint16_t>(pcm.size());
-        std::memcpy(chunk->data, pcm.data(), pcm.size() * sizeof(std::int16_t));
+        chunk->len_bytes = static_cast<std::uint16_t>(pcm.size());
+        for (std::size_t i = 0; i < pcm.size(); ++i) {
+            chunk->data[i] = pcm16_to_ulaw(pcm[i]);
+        }
 
         // Non-blocking enqueue. If the sender is stuck (network hiccup) and
         // the ring is full, drop the OLDEST chunk to keep the audio fresh —
@@ -379,9 +405,8 @@ private:
         if (client_ == nullptr) return;
         if (!esp_websocket_client_is_connected(client_)) return;
 
-        const auto* raw_ptr = reinterpret_cast<const std::uint8_t*>(chunk->data);
-        const std::size_t raw_len =
-            static_cast<std::size_t>(chunk->len_samples) * sizeof(std::int16_t);
+        const std::uint8_t* raw_ptr = chunk->data;
+        const std::size_t raw_len = chunk->len_bytes;
         const std::size_t needed_b64 = base64::encoded_size(raw_len);
         if (needed_b64 > b64_scratch_.size()) {
             // Shouldn't happen — start() pre-sizes for the largest chunk —
@@ -572,8 +597,12 @@ private:
 
         cJSON* in = cJSON_AddObjectToObject(audio, "input");
         cJSON* in_fmt = cJSON_AddObjectToObject(in, "format");
-        cJSON_AddStringToObject(in_fmt, "type", "audio/pcm");
-        cJSON_AddNumberToObject(in_fmt, "rate", config_.input_sample_rate_hz);
+        // Mic uplink is G.711 µ-law @ 8 kHz — 6× lighter on the wire than
+        // pcm16 @ 24 kHz, which made the audio path immune to coex /
+        // DTIM stalls eating its TCP send buffer. The mic side encodes
+        // PCM16 → µ-law in push_audio (see pcm16_to_ulaw). OpenAI Realtime
+        // accepts pcmu only at 8 kHz, so no rate field.
+        cJSON_AddStringToObject(in_fmt, "type", "audio/pcmu");
 
         cJSON* vad = cJSON_AddObjectToObject(in, "turn_detection");
         cJSON_AddStringToObject(vad, "type", "server_vad");
