@@ -339,8 +339,13 @@ private:
             emit_error(ConversationError::TransportInit, "websocket error");
             break;
         case WEBSOCKET_EVENT_CLOSED:
-            ESP_LOGW(kTag, "WEBSOCKET_EVENT_CLOSED");
-            set_state(ConversationState::Idle);
+            // Gemini silently closes the WS on bad setup (unknown model,
+            // unsupported field) — no DISCONNECTED, just CLOSED. Surface
+            // as a transport error so the conv-task recovery path runs
+            // instead of sitting Idle forever.
+            ESP_LOGW(kTag, "WEBSOCKET_EVENT_CLOSED (setup rejected?)");
+            set_state(ConversationState::Error);
+            emit_error(ConversationError::NotConnected, "websocket closed");
             break;
         default:
             break;
@@ -350,12 +355,24 @@ private:
     void on_websocket_data(const esp_websocket_event_data_t* data)
     {
         if (data == nullptr || data->data_len < 0) return;
-        // Gemini ships JSON over text frames; binary frames are unused.
         if (data->payload_offset == 0) {
             rx_len_ = 0;
             rx_op_code_ = data->op_code;
         }
-        if (rx_op_code_ != 0x01) return; // not text
+        // Gemini Live can ship server messages as either text (0x01) or
+        // binary (0x02 — JSON bytes, not protobuf). Everything else is a
+        // WS control frame: log close-frame contents so server-initiated
+        // disconnects show their code + reason in the trace.
+        if (rx_op_code_ != 0x01 && rx_op_code_ != 0x02) {
+            if (rx_op_code_ == 0x08 && data->data_len >= 2) {
+                const auto* bytes = reinterpret_cast<const std::uint8_t*>(data->data_ptr);
+                const std::uint16_t code = (bytes[0] << 8) | bytes[1];
+                const int reason_len = data->data_len - 2;
+                ESP_LOGW(kTag, "ws close: code=%u reason='%.*s'", code,
+                         reason_len, reinterpret_cast<const char*>(bytes + 2));
+            }
+            return;
+        }
         const std::size_t total = static_cast<std::size_t>(data->payload_len);
         const std::size_t chunk = static_cast<std::size_t>(data->data_len);
         if (rx_len_ + chunk > rx_capacity_) {
@@ -415,6 +432,9 @@ private:
             cJSON_AddItemToArray(parts, part);
         }
 
+        // Input / output transcription: server sends the recognised user
+        // utterance and the synthesised reply text — handy for the UI and
+        // for the balloon. Empty object enables the capability.
         if (config_.enable_input_transcription) {
             cJSON_AddObjectToObject(setup, "inputAudioTranscription");
             cJSON_AddObjectToObject(setup, "outputAudioTranscription");
@@ -430,7 +450,12 @@ private:
                 cJSON_AddStringToObject(d, "description", t.description.c_str());
                 cJSON* params = cJSON_Parse(t.parameters_json.c_str());
                 if (params != nullptr) {
-                    cJSON_AddItemToObject(d, "parameters", params);
+                    // `parameters` expects Google's OpenAPI 3.0.3 subset
+                    // (uppercase `"OBJECT"`/`"STRING"` etc). Our tool
+                    // factories use lowercase JSON Schema for OpenAI
+                    // compatibility, so feed them through the mutually-
+                    // exclusive `parametersJsonSchema` field instead.
+                    cJSON_AddItemToObject(d, "parametersJsonSchema", params);
                 }
                 cJSON_AddItemToArray(decls, d);
             }
@@ -438,11 +463,9 @@ private:
         }
 
         // Session resumption: if we have a handle from a prior goAway, ask
-        // the server to continue from there. The server will reply with new
-        // handles via sessionResumptionUpdate which we cache for next time.
-        // Always include the field so the server emits resumption updates;
-        // a null/empty handle just means "start a fresh session, but please
-        // give me resumption tokens".
+        // the server to continue from there. Always include the field so
+        // the server emits resumption updates; an empty handle is the
+        // documented way to opt in to fresh-session resumption tokens.
         cJSON* rs = cJSON_AddObjectToObject(setup, "sessionResumption");
         if (!session_handle_.empty()) {
             cJSON_AddStringToObject(rs, "handle", session_handle_.c_str());
@@ -468,6 +491,20 @@ private:
 
     void parse_server_event(const char* json, std::size_t len)
     {
+        // Temporary diagnostic for the first few messages so we can see what
+        // the server is actually sending during setup negotiation.
+        // One-shot peek at the first few non-audio frames so we can spot
+        // unexpected setup rejections / new event shapes in the logs.
+        // Audio (inlineData) is skipped — it's multi-KB base64 that dwarfs
+        // everything else and is already captured by the per-100-chunk
+        // audio_send heartbeat.
+        if (rx_log_count_ < 5 && std::strstr(json, "\"inlineData\"") == nullptr) {
+            const std::size_t snip = std::min<std::size_t>(len, 384);
+            ESP_LOGI(kTag, "rx[%u/%uB]: %.*s%s",
+                     rx_log_count_, static_cast<unsigned>(len),
+                     static_cast<int>(snip), json, snip < len ? "…" : "");
+            ++rx_log_count_;
+        }
         cJSON* root = cJSON_ParseWithLength(json, len);
         if (root == nullptr) {
             ESP_LOGW(kTag, "json parse failed");
@@ -524,6 +561,21 @@ private:
             }
         }
 
+        // First serverContent.modelTurn of a turn implies the server has
+        // decided the user's utterance ended and the model is now
+        // responding. OpenAI Realtime fires an explicit
+        // input_audio_buffer.speech_stopped that the conv-task hooks
+        // into to switch Local::Listening → Thinking (which is what
+        // gates AssistantAudioChunk processing). Gemini gives us no
+        // direct equivalent, so synthesise SpeechStopped here exactly
+        // once per turn, before any audio is emitted.
+        if (cJSON_GetObjectItemCaseSensitive(sc, "modelTurn") != nullptr && !turn_speech_stopped_emitted_) {
+            ConversationEvent ev{};
+            ev.type = ConversationEventType::SpeechStopped;
+            emit(ev);
+            turn_speech_stopped_emitted_ = true;
+        }
+
         // modelTurn.parts[].inlineData = base64 PCM 24 kHz audio.
         if (const cJSON* mt = cJSON_GetObjectItemCaseSensitive(sc, "modelTurn"); mt != nullptr) {
             const cJSON* parts = cJSON_GetObjectItemCaseSensitive(mt, "parts");
@@ -546,6 +598,10 @@ private:
                                 pcm->size() * sizeof(std::int16_t));
                     if (state_.load(std::memory_order_relaxed) != ConversationState::Speaking) {
                         set_state(ConversationState::Speaking);
+                        // Drop any mic chunks that were buffered between
+                        // the last enqueue and the server's response —
+                        // sending them now triggers a 1008 close on Gemini.
+                        drop_pending_audio();
                     }
                     ConversationEvent ev{};
                     ev.type = ConversationEventType::AssistantAudioChunk;
@@ -570,11 +626,16 @@ private:
             ev.type = ConversationEventType::AssistantAudioDone;
             emit(ev);
         }
-        // turnComplete: server ready for the next user turn.
+        // turnComplete: server ready for the next user turn. Drop back to
+        // Listening so push_audio starts enqueueing mic chunks again — its
+        // hot-path check (state != Listening → drop) is what kept us mute
+        // after the first reply. Re-arm the SpeechStopped synthesiser too.
         if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(sc, "turnComplete"))) {
             ConversationEvent ev{};
             ev.type = ConversationEventType::ResponseDone;
             emit(ev);
+            turn_speech_stopped_emitted_ = false;
+            set_state(ConversationState::Listening);
         }
     }
 
@@ -615,6 +676,24 @@ private:
         }
     }
 
+    // Drain the audio_tx_queue, freeing every queued chunk. Called when
+    // the server begins responding so we don't keep dribbling stale
+    // pre-turn mic samples that trigger Gemini's 1008 policy close.
+    void drop_pending_audio()
+    {
+        if (audio_tx_queue_ == nullptr) return;
+        AudioChunk* c = nullptr;
+        std::size_t dropped = 0;
+        while (xQueueReceive(audio_tx_queue_, &c, 0) == pdTRUE) {
+            if (c != nullptr) heap_caps_free(c);
+            ++dropped;
+        }
+        if (dropped > 0) {
+            ESP_LOGI(kTag, "dropped %u stale mic chunks at turn boundary",
+                     static_cast<unsigned>(dropped));
+        }
+    }
+
     // ---- audio sender task -------------------------------------------------
 
     static void sender_trampoline(void* arg)
@@ -642,6 +721,16 @@ private:
         if (client_ == nullptr) return;
         if (!esp_websocket_client_is_connected(client_)) return;
         if (!setup_sent_) return; // wait until setup has been emitted
+        // Don't stream mic audio while the server is mid-response. Gemini's
+        // server closes the WS with `code=1008 'Operation is not
+        // implemented, or supported, or enabled.'` when it receives audio
+        // frames during its own turn. push_audio drops at the
+        // enqueue side once state flips to Speaking, but stale chunks
+        // queued just before the transition still arrive here — silently
+        // discard them too.
+        if (state_.load(std::memory_order_relaxed) != ConversationState::Listening) {
+            return;
+        }
 
         const auto* raw_ptr = reinterpret_cast<const std::uint8_t*>(chunk->data);
         const std::size_t raw_len = chunk->len_samples * sizeof(std::int16_t);
@@ -688,7 +777,9 @@ private:
     std::mutex send_mutex_;
 
     bool setup_sent_{false};
+    bool turn_speech_stopped_emitted_{false};
     std::uint32_t audio_seq_{0};
+    unsigned rx_log_count_{0};
 
     // Resumption handle from goAway / sessionResumptionUpdate. Empty means
     // no prior session.
