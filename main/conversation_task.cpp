@@ -351,9 +351,11 @@ private:
     void service_playback()
     {
         // Barge-in: a touch on the head stops the reply and returns to
-        // listening. (The mic is physically off while speaking, so this is the
-        // only way to interrupt on the half-duplex CoreS3 hardware.)
-        if (touch_ != nullptr && touch_->read().any_touched()) {
+        // listening. (The mic is physically off while speaking, so this is
+        // the only way to interrupt on the half-duplex CoreS3 hardware.)
+        // Use firmly_touched() so we don't barge in on a stray Level-1
+        // RFI blip — those happen often enough to clobber every reply.
+        if (touch_ != nullptr && touch_->read().firmly_touched()) {
             barge_in();
             return;
         }

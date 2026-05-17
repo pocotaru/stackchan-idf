@@ -27,9 +27,23 @@ public:
     struct Reading {
         std::array<std::uint8_t, kZoneCount> intensities{};
 
+        // Any zone above 0. Includes the chip's "Low" level which fires
+        // easily from proximity / 2.4 GHz EMI on this board — fine for
+        // diagnostic logging, not for triggering an action.
         bool any_touched() const noexcept
         {
             return intensities[0] > 0 || intensities[1] > 0 || intensities[2] > 0;
+        }
+        // Middle or Back at "Middle" intensity or above (>= 2). Front is
+        // deliberately excluded: on this board the Front electrode reports
+        // a steady false intensity 2 with nothing touching it (auto-calib
+        // baseline drift / nearby ground / unknown hardware issue), and
+        // including it triggered ~one false nadenade every 5 s. People pet
+        // the top center of the head (Middle) anyway. Matches the
+        // CTRL1=0x22 "interrupt on Middle/High" intent.
+        bool firmly_touched() const noexcept
+        {
+            return intensities[1] >= 2 || intensities[2] >= 2;
         }
         std::uint8_t front() const noexcept { return intensities[0]; }
         std::uint8_t middle() const noexcept { return intensities[1]; }

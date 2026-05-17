@@ -210,7 +210,17 @@ void demo_loop(const std::string& jtts_config_json)
         // render and servo tasks keep running so animation stays smooth.
         if (g_touch != nullptr && !wifi_warning_active && now_ms >= next_nadenade_ms) {
             const auto reading = g_touch->read();
+            // TEMP DIAGNOSTIC: every time *any* zone shows nonzero, log the
+            // raw per-zone intensities. Lets us see what RFI vs. an actual
+            // touch looks like on this board. Remove once tuned.
             if (reading.any_touched()) {
+                ESP_LOGI(kTag, "touch raw: front=%u middle=%u back=%u",
+                         reading.front(), reading.middle(), reading.back());
+            }
+            // Use firmly_touched() (intensity >= 2) so the chip's stray
+            // Level-1 readings from BLE/Wi-Fi RFI don't accumulate into
+            // a false nadenade trigger.
+            if (reading.firmly_touched()) {
                 if (touch_start_ms == 0) {
                     touch_start_ms = now_ms;
                 } else if (now_ms - touch_start_ms >= kNadenadeMinTouchMs) {
@@ -249,6 +259,9 @@ void demo_loop(const std::string& jtts_config_json)
                     continue;
                 }
             } else {
+                // Strict reset: any sample that's not firmly touched drops
+                // the debounce. That way Level-1 noise can't keep the timer
+                // alive between rare false Level-2 spikes from RFI.
                 touch_start_ms = 0;
             }
         }

@@ -25,9 +25,15 @@ constexpr std::uint8_t kRegCalHold1 = 0x0E;
 constexpr std::uint8_t kRegCalHold2 = 0x0F;
 constexpr std::uint8_t kRegOutput1 = 0x10;
 
-// Sensitivity nibble for "Type High, Level 4" (each nibble configures one
-// pair of channels; same value in both nibbles).
-constexpr std::uint8_t kSensitivityHighLevel4 = 0xCC;
+// Sensitivity nibble (each nibble configures one pair of channels; same
+// value in both nibbles). "Type High, Level 3" — one step down from the
+// max (0xCC). The stock Level-4 setting picked up enough ambient noise
+// on this board (Wi-Fi + BLE both active on 2.4 GHz right next to the
+// sensor) to randomly trip the Level-1 "Low" output, which the nadenade
+// state machine then debounced into a false trigger. Level 3 still
+// resolves a real fingertip touch comfortably while suppressing the
+// proximity / EMI glitches.
+constexpr std::uint8_t kSensitivityHighLevel3 = 0xBB;
 
 // CTRL1 = Auto Mode, FTC=01, response interrupt on Middle/High.
 constexpr std::uint8_t kCtrl1Value = 0x22;
@@ -65,7 +71,7 @@ tl::expected<Si12tTouch, Error> Si12tTouch::probe(std::uint8_t address)
         return tl::unexpected{Error::TouchProbe};
     }
     for (std::uint8_t reg = kRegSensitivity1; reg <= kRegSensitivity5; ++reg) {
-        if (!chip.write_register(reg, kSensitivityHighLevel4)) {
+        if (!chip.write_register(reg, kSensitivityHighLevel3)) {
             ESP_LOGE(kTag, "Si12T sensitivity write 0x%02X failed", reg);
             return tl::unexpected{Error::TouchProbe};
         }
