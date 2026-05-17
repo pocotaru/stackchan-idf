@@ -7,6 +7,10 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      # tools/settings.html is the canonical source; pages.yml copies it
+      # into _site/. Without this trigger the hosted settings page stays
+      # stale when settings.html is the only file that changed.
+      - 'tools/settings.html'
       - '.github/workflows/pages.yml'
   release:
     types: [published]
