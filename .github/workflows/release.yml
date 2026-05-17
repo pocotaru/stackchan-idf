@@ -14,7 +14,11 @@ jobs:
     name: Build Firmware
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:release-v6.0
+      # Pinned to v5.4 to match local development. v6.0 dropped the built-in
+      # `json` (cJSON) component in favour of an IDF component-manager
+      # dependency; our `conversation` component requires it directly and
+      # we don't ship a manifest entry for it yet.
+      image: espressif/idf:release-v5.4
 
     steps:
       - name: Checkout repository
@@ -139,7 +143,7 @@ jobs:
                `stackchan_idf.bin` を選択 → 書き込み
 
             ## Build Information
-            - **ESP-IDF**: release-v6.0
+            - **ESP-IDF**: release-v5.4
             - **Target**: ESP32-S3
             - **Build Date**: ${{ steps.version.outputs.build_date }}
             - **Commit**: ${{ github.sha }}
