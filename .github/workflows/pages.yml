@@ -18,7 +18,10 @@ on:
       - 'components/avatar/**'
       - 'components/avatar_vm/**'
       - 'tools/avatar_dsl/**'
-      - 'assets/default_face.avdsl'
+      # All DSL preset sources (default / omega / future additions) are
+      # inlined into avatar.html + settings_wifi.html via inject.mjs, so a
+      # change to any of them must rebuild the Pages site.
+      - 'assets/*.avdsl'
       - '.github/workflows/pages.yml'
   release:
     types: [published]
