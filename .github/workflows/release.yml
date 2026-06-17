@@ -4,11 +4,12 @@ name: Build and Release Firmware
 # ESP-IDF container and attach the artifacts to a GitHub Release. Manual
 # dispatch is supported too for smoke-testing the CI without cutting a tag.
 #
-# The build is fanned out across `BOARD` variants — cores3 (CoreS3 + M5/Takao
-# base, 16 MB / Quad PSRAM) and atoms3r (AtomS3R + Atomic ECHO BASE, 8 MB /
-# Octal PSRAM) — because the PSRAM mode is locked in by the bootloader at
-# link time and cannot be switched at runtime. Each board ships as its own
-# ZIP attached to the same Release.
+# Single-job sequential build for cores3 / atoms3r / atoms3 — keeping these
+# in the same runner avoids paying for the container pull + apt install + IDF
+# export setup three times (was ~2 min × 3 in the old matrix). Each board
+# writes to its own `build-<board>/` directory so the artifacts stay isolated.
+# Before each build we `idf.py fullclean` that board's directory as belt-and-
+# braces in case a stale CMake cache from a prior run leaks the wrong target.
 on:
   push:
     tags:
@@ -24,15 +25,8 @@ permissions:
 
 jobs:
   build:
-    name: Build Firmware (${{ matrix.board }})
+    name: Build Firmware (cores3 / atoms3r / atoms3)
     runs-on: ubuntu-latest
-    strategy:
-      # Don't cancel cores3 just because atoms3r failed (and vice-versa); we
-      # still want a partial release if one board's build hits a transient
-      # issue.
-      fail-fast: false
-      matrix:
-        board: [cores3, atoms3r, atoms3]
     container:
       # Pinned to v5.4 to match local development. v6.0 dropped the built-in
       # `json` (cJSON) component in favour of an IDF component-manager
@@ -58,7 +52,6 @@ jobs:
           git rev-parse --short HEAD
           git diff-index --quiet HEAD -- && echo "Working tree clean" || echo "Working tree dirty"
           echo "Current ref: ${GITHUB_REF}"
-          echo "Board: ${{ matrix.board }}"
 
       - name: Install Node.js (avatar DSL compiler)
         shell: bash
@@ -78,42 +71,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/components/M5Unified"
           tools/apply-m5-patches.sh
 
-      - name: Pin PROJECT_VER for the build
-        # `tools/apply-m5-patches.sh` modifies the M5Unified submodule's
-        # working tree, which makes ESP-IDF's internal
-        # `git describe --tags --dirty` (run during cmake) tack a -dirty
-        # suffix onto the version stamped into esp_app_desc. Writing the
-        # resolved version to version.txt at the project root takes priority
-        # over git_describe (see project.cmake's PROJECT_VER resolution
-        # order: version.txt > project(VERSION ...) > git describe) and
-        # gives us a clean, deterministic version string in CI builds.
-        shell: bash
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          else
-            VERSION="dev-${GITHUB_SHA::8}"
-          fi
-          echo "$VERSION" > version.txt
-          echo "version.txt contents: $(cat version.txt)"
-
-      - name: Build firmware (BOARD=${{ matrix.board }})
-        shell: bash
-        env:
-          CI: true
-        run: |
-          . $IDF_PATH/export.sh
-          make set-target BOARD=${{ matrix.board }}
-          make build BOARD=${{ matrix.board }}
-
-      - name: Generate single firmware image
-        run: |
-          python3 script/pack_firmware.py \
-            --build-dir build-${{ matrix.board }} \
-            --out firmware.bin
-          ls -lh firmware.bin
-
-      - name: Extract version from tag
+      - name: Extract version
         id: version
         shell: bash
         run: |
@@ -128,60 +86,98 @@ jobs:
           echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
           echo "Build date: $BUILD_DATE"
 
-      - name: Prepare release artifacts
+      - name: Pin PROJECT_VER for the build
+        # `tools/apply-m5-patches.sh` modifies the M5Unified submodule's
+        # working tree, which makes ESP-IDF's internal
+        # `git describe --tags --dirty` (run during cmake) tack a -dirty
+        # suffix onto the version stamped into esp_app_desc. Writing the
+        # resolved version to version.txt at the project root takes priority
+        # over git_describe (see project.cmake's PROJECT_VER resolution
+        # order: version.txt > project(VERSION ...) > git describe) and
+        # gives us a clean, deterministic version string in CI builds.
         shell: bash
         env:
-          BUILD_DIR: build-${{ matrix.board }}
           VERSION: ${{ steps.version.outputs.version }}
-          BOARD: ${{ matrix.board }}
         run: |
+          echo "$VERSION" > version.txt
+          echo "version.txt contents: $(cat version.txt)"
+
+      - name: Build firmware for cores3 / atoms3r / atoms3
+        shell: bash
+        env:
+          CI: true
+          VERSION: ${{ steps.version.outputs.version }}
+        # Sequential build — each board uses its own build-<board>/ tree
+        # (driven by the Makefile + sdkconfig.defaults.<board>), so artifacts
+        # never collide. `idf.py fullclean` before each board strips any
+        # stale CMake cache, generator, etc. that might have been carried
+        # in via the checkout (the runner is fresh, but doing this keeps
+        # the script robust against re-runs and against future caching
+        # tweaks that might re-use the workspace).
+        run: |
+          set -euo pipefail
+          . $IDF_PATH/export.sh
           mkdir -p release
-          cp "$BUILD_DIR/bootloader/bootloader.bin"              release/
-          cp "$BUILD_DIR/partition_table/partition-table.bin"    release/
-          cp "$BUILD_DIR/ota_data_initial.bin"                   release/
-          cp "$BUILD_DIR/stackchan_idf.bin"                      release/
-          cp firmware.bin release/firmware-${VERSION}-${BOARD}.bin
-          cp "$BUILD_DIR/flash_args" release/
-          cp README.md release/ 2>/dev/null || true
+          for board in cores3 atoms3r atoms3; do
+            echo "::group::Build $board"
+            echo "=== Cleaning build-$board ==="
+            rm -rf "build-$board"
+            echo "=== Setting target for $board ==="
+            make set-target BOARD=$board
+            echo "=== Building $board ==="
+            make build BOARD=$board
+            echo "=== Packing firmware for $board ==="
+            python3 script/pack_firmware.py \
+              --build-dir "build-$board" \
+              --out "firmware-$board.bin"
+            ls -lh "firmware-$board.bin"
+            # Stage per-board release directory and zip it.
+            outdir="release/$board"
+            mkdir -p "$outdir"
+            cp "build-$board/bootloader/bootloader.bin"           "$outdir/"
+            cp "build-$board/partition_table/partition-table.bin" "$outdir/"
+            cp "build-$board/ota_data_initial.bin"                "$outdir/"
+            cp "build-$board/stackchan_idf.bin"                   "$outdir/"
+            cp "firmware-$board.bin" "$outdir/firmware-${VERSION}-${board}.bin"
+            cp "build-$board/flash_args" "$outdir/"
+            cp README.md "$outdir/" 2>/dev/null || true
+            echo "=== Firmware size for $board ==="
+            python3 -m esp_idf_size "build-$board/stackchan_idf.map" --format=text || true
+            (cd "$outdir" && zip -r "../../firmware-${VERSION}-${board}.zip" .)
+            ls -lh "firmware-${VERSION}-${board}.zip"
+            echo "::endgroup::"
+          done
+          echo "=== Final artifacts ==="
+          ls -lh firmware-${VERSION}-*.zip
 
-          echo "=== Firmware Size Information (BOARD=${BOARD}) ==="
-          python3 -m esp_idf_size "$BUILD_DIR/stackchan_idf.map" --format=text || true
-
-          ls -lh release/
-
-      - name: Create firmware ZIP
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          BOARD: ${{ matrix.board }}
-        run: |
-          cd release
-          zip -r "../firmware-${VERSION}-${BOARD}.zip" .
-          cd ..
-          ls -lh "firmware-${VERSION}-${BOARD}.zip"
-
-      - name: Upload firmware artifact
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ steps.version.outputs.version }}-${{ matrix.board }}
-          path: release/
+          name: firmware-${{ steps.version.outputs.version }}
+          path: |
+            firmware-${{ steps.version.outputs.version }}-cores3.zip
+            firmware-${{ steps.version.outputs.version }}-atoms3r.zip
+            firmware-${{ steps.version.outputs.version }}-atoms3.zip
           retention-days: 90
 
       - name: Create / update Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
-          # Each matrix leg uploads its own zip into the same Release; the
-          # action merges by tag name and skips duplicates.
-          files: firmware-${{ steps.version.outputs.version }}-${{ matrix.board }}.zip
+          # All three board ZIPs uploaded in one go.
+          files: |
+            firmware-${{ steps.version.outputs.version }}-cores3.zip
+            firmware-${{ steps.version.outputs.version }}-atoms3r.zip
+            firmware-${{ steps.version.outputs.version }}-atoms3.zip
           body: |
             # Stack-chan Firmware ${{ steps.version.outputs.version }}
 
-            Stack-chan firmware (M5Stack CoreS3 / AtomS3R 両対応)。
+            Stack-chan firmware (M5Stack CoreS3 / AtomS3R / AtomS3 三方対応)。
 
             ## 対応ボード
             - **CoreS3 + M5/Takao ベース** (`firmware-${{ steps.version.outputs.version }}-cores3.zip`、16 MB flash / Quad PSRAM)
             - **AtomS3R + Atomic ECHO BASE** "アトムニャン" (`firmware-${{ steps.version.outputs.version }}-atoms3r.zip`、8 MB flash / Octal PSRAM)
+            - **AtomS3 + Atomic ECHO BASE** slim プロファイル (`firmware-${{ steps.version.outputs.version }}-atoms3.zip`、8 MB flash / PSRAM なし)
 
             PSRAM モードは bootloader レベルで確定するため、ボードごとに別 firmware です。
 
@@ -199,7 +195,7 @@ jobs:
             にアクセスして本リリースを選択し、ボードを選んでから書き込んでください。
 
             ### コマンドラインから初回書き込み
-            1. ボードに合った ZIP (`-cores3` / `-atoms3r`) をダウンロード・展開
+            1. ボードに合った ZIP (`-cores3` / `-atoms3r` / `-atoms3`) をダウンロード・展開
             2. esptool で書き込み:
                ```bash
                esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash \
