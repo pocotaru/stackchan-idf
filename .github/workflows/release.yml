@@ -4,13 +4,23 @@ name: Build and Release Firmware
 # ESP-IDF container and attach the artifacts to a GitHub Release. Manual
 # dispatch is supported too for smoke-testing the CI without cutting a tag.
 #
-# Single-job sequential build for cores3 / atoms3r / atoms3 / stopwatch —
-# keeping these in the same runner avoids paying for the container pull +
-# apt install + IDF export setup multiple times (was ~2 min × N in the old
-# matrix). Each board writes to its own `build-<board>/` directory so the
-# artifacts stay isolated. Before each build we `idf.py fullclean` that
-# board's directory as belt-and-braces in case a stale CMake cache from a
-# prior run leaks the wrong target.
+# Layout (2026-06 onwards):
+#   1. `build` job runs 4× in parallel (matrix on board), each shard does
+#      its own checkout + env init + ccache-warmed build + zip + artifact
+#      upload. Per-shard ccache cache survives across runs and pulls main
+#      branch hits even on a fresh tag, keeping compile time ~30 s after
+#      the first warm-up.
+#   2. `release` job (needs: build) downloads the 4 artifacts and attaches
+#      them to a single GitHub Release in one go. Only runs on tag pushes.
+#
+# Previously the build was one sequential job to avoid paying the Docker
+# pull + apt install + IDF env setup 4× (was ~2 min × 4 in the old plain
+# matrix). With matrix shards on separate VMs the env-init cost is paid
+# 4× but happens in parallel — wall-clock impact is ≈ 1× pull. The
+# ccache cache cuts the per-shard compile from ~3 min to ~30 s once warm,
+# so the wall-clock floor becomes the env-init step (~90 s) rather than
+# the compile, and we no longer benefit from sharing the env across the
+# 4 boards inside one job.
 on:
   push:
     tags:
@@ -26,8 +36,16 @@ permissions:
 
 jobs:
   build:
-    name: Build Firmware (cores3 / atoms3r / atoms3 / stopwatch)
+    name: Build ${{ matrix.board }}
     runs-on: ubuntu-latest
+    strategy:
+      # Don't kill sibling shards on one board's failure — we still want
+      # to know which other boards built OK so we can rerun only the bad
+      # one. The aggregating release job below depends on all four
+      # artifacts though, so a partial success still won't publish.
+      fail-fast: false
+      matrix:
+        board: [cores3, atoms3r, atoms3, stopwatch]
     container:
       # Pinned to v5.4 to match local development. v6.0 dropped the built-in
       # `json` (cJSON) component in favour of an IDF component-manager
@@ -72,6 +90,24 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/components/M5Unified"
           tools/apply-m5-patches.sh
 
+      - name: ccache (compiler cache)
+        # Per-board cache key — the same .c source can compile differently
+        # for different boards (sdkconfig.defaults.<board> changes target /
+        # PSRAM mode / Kconfig macros), so we don't try to share .o files
+        # across shards. Restore-keys lets a new tag still pick up the
+        # most recent main-branch cache on cold start.
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: idf-v5.4-${{ matrix.board }}-${{ github.ref_name }}
+          restore-keys: |
+            idf-v5.4-${{ matrix.board }}-
+          max-size: 500M
+          variant: ccache
+          # Tell ESP-IDF's cmake module to actually invoke ccache. Without
+          # this env var ESP-IDF skips its compiler-launcher hook even if
+          # ccache is on PATH.
+          create-symlink: true
+
       - name: Extract version
         id: version
         shell: bash
@@ -103,70 +139,82 @@ jobs:
           echo "$VERSION" > version.txt
           echo "version.txt contents: $(cat version.txt)"
 
-      - name: Build firmware for cores3 / atoms3r / atoms3 / stopwatch
+      - name: Build firmware for ${{ matrix.board }}
         shell: bash
         env:
           CI: true
           VERSION: ${{ steps.version.outputs.version }}
-        # Sequential build — each board uses its own build-<board>/ tree
-        # (driven by the Makefile + sdkconfig.defaults.<board>), so artifacts
-        # never collide. `idf.py fullclean` before each board strips any
-        # stale CMake cache, generator, etc. that might have been carried
-        # in via the checkout (the runner is fresh, but doing this keeps
-        # the script robust against re-runs and against future caching
-        # tweaks that might re-use the workspace).
+          BOARD: ${{ matrix.board }}
+          IDF_CCACHE_ENABLE: "1"
         run: |
           set -euo pipefail
           . $IDF_PATH/export.sh
-          mkdir -p release
-          for board in cores3 atoms3r atoms3 stopwatch; do
-            echo "::group::Build $board"
-            echo "=== Cleaning build-$board ==="
-            rm -rf "build-$board"
-            echo "=== Setting target for $board ==="
-            make set-target BOARD=$board
-            echo "=== Building $board ==="
-            make build BOARD=$board
-            echo "=== Packing firmware for $board ==="
-            python3 script/pack_firmware.py \
-              --build-dir "build-$board" \
-              --out "firmware-$board.bin"
-            ls -lh "firmware-$board.bin"
-            # Stage per-board release directory and zip it.
-            outdir="release/$board"
-            mkdir -p "$outdir"
-            cp "build-$board/bootloader/bootloader.bin"           "$outdir/"
-            cp "build-$board/partition_table/partition-table.bin" "$outdir/"
-            cp "build-$board/ota_data_initial.bin"                "$outdir/"
-            cp "build-$board/stackchan_idf.bin"                   "$outdir/"
-            cp "firmware-$board.bin" "$outdir/firmware-${VERSION}-${board}.bin"
-            cp "build-$board/flash_args" "$outdir/"
-            cp README.md "$outdir/" 2>/dev/null || true
-            echo "=== Firmware size for $board ==="
-            python3 -m esp_idf_size "build-$board/stackchan_idf.map" --format=text || true
-            (cd "$outdir" && zip -r "../../firmware-${VERSION}-${board}.zip" .)
-            ls -lh "firmware-${VERSION}-${board}.zip"
-            echo "::endgroup::"
-          done
-          echo "=== Final artifacts ==="
-          ls -lh firmware-${VERSION}-*.zip
+          echo "=== ccache config ==="
+          ccache --version | head -1
+          ccache --show-config | grep -E "max_size|cache_dir|compiler_check" || true
+          echo "=== Cleaning build-$BOARD ==="
+          rm -rf "build-$BOARD"
+          echo "=== Setting target for $BOARD ==="
+          make set-target BOARD="$BOARD"
+          echo "=== Building $BOARD ==="
+          make build BOARD="$BOARD"
+          echo "=== ccache stats ==="
+          ccache --show-stats || true
+          echo "=== Packing firmware for $BOARD ==="
+          python3 script/pack_firmware.py \
+            --build-dir "build-$BOARD" \
+            --out "firmware-$BOARD.bin"
+          ls -lh "firmware-$BOARD.bin"
+          outdir="release/$BOARD"
+          mkdir -p "$outdir"
+          cp "build-$BOARD/bootloader/bootloader.bin"           "$outdir/"
+          cp "build-$BOARD/partition_table/partition-table.bin" "$outdir/"
+          cp "build-$BOARD/ota_data_initial.bin"                "$outdir/"
+          cp "build-$BOARD/stackchan_idf.bin"                   "$outdir/"
+          cp "firmware-$BOARD.bin" "$outdir/firmware-${VERSION}-${BOARD}.bin"
+          cp "build-$BOARD/flash_args" "$outdir/"
+          cp README.md "$outdir/" 2>/dev/null || true
+          echo "=== Firmware size for $BOARD ==="
+          python3 -m esp_idf_size "build-$BOARD/stackchan_idf.map" --format=text || true
+          (cd "$outdir" && zip -r "../../firmware-${VERSION}-${BOARD}.zip" .)
+          ls -lh "firmware-${VERSION}-${BOARD}.zip"
 
-      - name: Upload firmware artifacts
+      - name: Upload firmware artifact (${{ matrix.board }})
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ steps.version.outputs.version }}
-          path: |
-            firmware-${{ steps.version.outputs.version }}-cores3.zip
-            firmware-${{ steps.version.outputs.version }}-atoms3r.zip
-            firmware-${{ steps.version.outputs.version }}-atoms3.zip
-            firmware-${{ steps.version.outputs.version }}-stopwatch.zip
+          name: firmware-${{ steps.version.outputs.version }}-${{ matrix.board }}
+          path: firmware-${{ steps.version.outputs.version }}-${{ matrix.board }}.zip
           retention-days: 90
 
+  release:
+    name: Create GitHub Release
+    needs: build
+    # Only attach to a Release on actual tag pushes — manual dispatch runs
+    # just build the artifacts and stop. The 4 matrix shards all upload
+    # their own artifact; this job aggregates them.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Glob over the per-board artifact names uploaded by the build
+          # matrix. merge-multiple flattens them into one directory.
+          pattern: firmware-${{ steps.version.outputs.version }}-*
+          merge-multiple: true
+
       - name: Create / update Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
-          # All four board ZIPs uploaded in one go.
           files: |
             firmware-${{ steps.version.outputs.version }}-cores3.zip
             firmware-${{ steps.version.outputs.version }}-atoms3r.zip
