@@ -4,12 +4,13 @@ name: Build and Release Firmware
 # ESP-IDF container and attach the artifacts to a GitHub Release. Manual
 # dispatch is supported too for smoke-testing the CI without cutting a tag.
 #
-# Single-job sequential build for cores3 / atoms3r / atoms3 — keeping these
-# in the same runner avoids paying for the container pull + apt install + IDF
-# export setup three times (was ~2 min × 3 in the old matrix). Each board
-# writes to its own `build-<board>/` directory so the artifacts stay isolated.
-# Before each build we `idf.py fullclean` that board's directory as belt-and-
-# braces in case a stale CMake cache from a prior run leaks the wrong target.
+# Single-job sequential build for cores3 / atoms3r / atoms3 / stopwatch —
+# keeping these in the same runner avoids paying for the container pull +
+# apt install + IDF export setup multiple times (was ~2 min × N in the old
+# matrix). Each board writes to its own `build-<board>/` directory so the
+# artifacts stay isolated. Before each build we `idf.py fullclean` that
+# board's directory as belt-and-braces in case a stale CMake cache from a
+# prior run leaks the wrong target.
 on:
   push:
     tags:
@@ -25,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Firmware (cores3 / atoms3r / atoms3)
+    name: Build Firmware (cores3 / atoms3r / atoms3 / stopwatch)
     runs-on: ubuntu-latest
     container:
       # Pinned to v5.4 to match local development. v6.0 dropped the built-in
@@ -102,7 +103,7 @@ jobs:
           echo "$VERSION" > version.txt
           echo "version.txt contents: $(cat version.txt)"
 
-      - name: Build firmware for cores3 / atoms3r / atoms3
+      - name: Build firmware for cores3 / atoms3r / atoms3 / stopwatch
         shell: bash
         env:
           CI: true
@@ -118,7 +119,7 @@ jobs:
           set -euo pipefail
           . $IDF_PATH/export.sh
           mkdir -p release
-          for board in cores3 atoms3r atoms3; do
+          for board in cores3 atoms3r atoms3 stopwatch; do
             echo "::group::Build $board"
             echo "=== Cleaning build-$board ==="
             rm -rf "build-$board"
@@ -158,26 +159,29 @@ jobs:
             firmware-${{ steps.version.outputs.version }}-cores3.zip
             firmware-${{ steps.version.outputs.version }}-atoms3r.zip
             firmware-${{ steps.version.outputs.version }}-atoms3.zip
+            firmware-${{ steps.version.outputs.version }}-stopwatch.zip
           retention-days: 90
 
       - name: Create / update Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v1
         with:
-          # All three board ZIPs uploaded in one go.
+          # All four board ZIPs uploaded in one go.
           files: |
             firmware-${{ steps.version.outputs.version }}-cores3.zip
             firmware-${{ steps.version.outputs.version }}-atoms3r.zip
             firmware-${{ steps.version.outputs.version }}-atoms3.zip
+            firmware-${{ steps.version.outputs.version }}-stopwatch.zip
           body: |
             # Stack-chan Firmware ${{ steps.version.outputs.version }}
 
-            Stack-chan firmware (M5Stack CoreS3 / AtomS3R / AtomS3 三方対応)。
+            Stack-chan firmware (M5Stack CoreS3 / AtomS3R / AtomS3 / StopWatch 四方対応)。
 
             ## 対応ボード
             - **CoreS3 + M5/Takao ベース** (`firmware-${{ steps.version.outputs.version }}-cores3.zip`、16 MB flash / Quad PSRAM)
             - **AtomS3R + Atomic ECHO BASE** "アトムニャン" (`firmware-${{ steps.version.outputs.version }}-atoms3r.zip`、8 MB flash / Octal PSRAM)
             - **AtomS3 + Atomic ECHO BASE** slim プロファイル (`firmware-${{ steps.version.outputs.version }}-atoms3.zip`、8 MB flash / PSRAM なし)
+            - **M5 StopWatch (C152)** 円形 AMOLED 466×466 + ES8311 + BMI270 + RX8130CE + 振動モータ (`firmware-${{ steps.version.outputs.version }}-stopwatch.zip`、16 MB flash / Octal PSRAM)
 
             PSRAM モードは bootloader レベルで確定するため、ボードごとに別 firmware です。
 
@@ -195,7 +199,7 @@ jobs:
             にアクセスして本リリースを選択し、ボードを選んでから書き込んでください。
 
             ### コマンドラインから初回書き込み
-            1. ボードに合った ZIP (`-cores3` / `-atoms3r` / `-atoms3`) をダウンロード・展開
+            1. ボードに合った ZIP (`-cores3` / `-atoms3r` / `-atoms3` / `-stopwatch`) をダウンロード・展開
             2. esptool で書き込み:
                ```bash
                esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash \
