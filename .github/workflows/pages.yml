@@ -124,6 +124,20 @@ jobs:
                 *)                              board="cores3" ;; # legacy fallback
               esac
               boards_json=$(echo "$boards_json" | jq --arg b "$board" --arg z "$asset" '.[$b] = $z')
+              # Also extract the OTA payload (stackchan_idf.bin — app
+              # partition image only, NOT the firmware-<tag>-<board>.bin
+              # combined image which includes bootloader/partition table)
+              # and stage it at a stable URL for the on-device
+              # /api/ota/release endpoint:
+              #   firmware/<tag>/<board>/stackchan_idf.bin
+              # Skip silently if the ZIP doesn't contain one (older
+              # releases pre-OTA-release support).
+              if unzip -p "$dest/$asset" stackchan_idf.bin > /tmp/sc.bin 2>/dev/null \
+                 && [ -s /tmp/sc.bin ]; then
+                mkdir -p "$dest/$board"
+                mv /tmp/sc.bin "$dest/$board/stackchan_idf.bin"
+                echo "[ok] $tag/$board/stackchan_idf.bin ($(stat -c%s "$dest/$board/stackchan_idf.bin") bytes)"
+              fi
               echo "[ok] $tag/$board -> $dest/$asset"
             done <<< "$assets"
             echo "{\"tag\":\"$tag\",\"boards\":$boards_json}" >> /tmp/per_tag.ndjson
