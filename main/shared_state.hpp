@@ -31,6 +31,17 @@ enum class ConvStatus : int {
     Error,        // connect attempt failed
 };
 
+// Top-right "processing" HUD phase for the render task. Distinct from
+// ConvStatus (which collapses thinking + speaking into Talking) because the
+// indicator must tell three things apart: the mic is streaming your voice up
+// (spinner), your turn ended and we're waiting for the reply (blink), and
+// done / not our turn (nothing).
+enum class HudPhase : int {
+    None = 0,
+    Listening,  // mic streaming up — rotating spinner
+    Thinking,   // turn ended, awaiting the reply — blinking dot
+};
+
 // A value guarded by a mutex with a lock-free version counter: the writer
 // (BLE host / HTTP worker / boot seed) calls set(); a polling consumer
 // (render task, demo_loop) watches version() each tick and takes a
@@ -139,6 +150,9 @@ public:
         // storm (repeated API connection failures) is visible.
         std::atomic<ConvStatus> status{ConvStatus::Disabled};
         std::atomic<std::uint32_t> reconnects{0};
+        // Render-task HUD indicator phase (top-right glyph). Set from the
+        // conversation Local state machine in set_local().
+        std::atomic<HudPhase> hud{HudPhase::None};
         // Cooperative I2S handoff flag — see audio_stream_active below.
         std::atomic<bool> yielded_i2s{false};
     };
