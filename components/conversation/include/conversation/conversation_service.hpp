@@ -56,6 +56,13 @@ struct ConversationConfig {
     // Cloudflare Access service token in front of a proxied API. Empty = none.
     std::string extra_headers;
     bool enable_input_transcription{true};
+    // Enable server-side Google Search grounding (Gemini Live only). When set,
+    // the client adds a `{"googleSearch":{}}` entry to the setup `tools` array
+    // so the model can look up current information (weather, news, dates) and
+    // ground its spoken reply. The search runs entirely on Google's side — no
+    // toolCall round-trip to the device. Ignored by the OpenAI / XiaoZhi
+    // clients.
+    bool enable_google_search{false};
     std::uint32_t vad_silence_ms{500};
     std::uint32_t vad_prefix_padding_ms{300};
     float vad_threshold{0.5f};

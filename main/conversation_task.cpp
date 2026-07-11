@@ -95,7 +95,8 @@ const char* kInstructions =
     "フレンドリーで元気いっぱい、少し子供っぽい口調で、短く返事をします。ユーザーとは日本語で会話してください。ただし、ユーザーが日本語以外の言語（英語）などで話したいと要望したときは、ユーザーが要望する言語に切り替えてください。"
     "顔の表情と首の向きを変えられます。気持ちに合わせて set_expression や set_head_pose ツールを使ってください。"
     "また speak_katakoto ツールでロボット風のカタコト声を出すこともできます。"
-    "ものまね・効果音・繰り返しなど演出的に使ってください（ツール呼び出しのターンでは普通の声で続けて喋らなくて構いません）。";
+    "ものまね・効果音・繰り返しなど演出的に使ってください（ツール呼び出しのターンでは普通の声で続けて喋らなくて構いません）。"
+    "今日の天気・ニュース・最新の出来事・現在の日付など、リアルタイムの情報を聞かれたら、Google検索で調べてから答えてください。";
 
 conv::ToolDefinition make_set_expression_tool()
 {
@@ -378,6 +379,9 @@ private:
             // preview is what's actually live on the Developer API right now.
             cfg.model = "gemini-2.5-flash-native-audio-preview-12-2025";
             cfg.voice = "Aoede"; // pre-built voice name; OK to leave empty
+            // Let Gemini ground on Google Search for current info (weather,
+            // news, today's date). Server-side; no device-side tool handler.
+            cfg.enable_google_search = true;
         } else {
             cfg.model = CONFIG_STACKCHAN_OPENAI_REALTIME_MODEL;
             cfg.voice = CONFIG_STACKCHAN_OPENAI_VOICE;

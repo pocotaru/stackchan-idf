@@ -540,26 +540,36 @@ private:
             cJSON_AddObjectToObject(setup, "outputAudioTranscription");
         }
 
-        if (!config_.tools.empty()) {
+        if (!config_.tools.empty() || config_.enable_google_search) {
             cJSON* tools = cJSON_AddArrayToObject(setup, "tools");
-            cJSON* tool = cJSON_CreateObject();
-            cJSON* decls = cJSON_AddArrayToObject(tool, "functionDeclarations");
-            for (const auto& t : config_.tools) {
-                cJSON* d = cJSON_CreateObject();
-                cJSON_AddStringToObject(d, "name", t.name.c_str());
-                cJSON_AddStringToObject(d, "description", t.description.c_str());
-                cJSON* params = cJSON_Parse(t.parameters_json.c_str());
-                if (params != nullptr) {
-                    // `parameters` expects Google's OpenAPI 3.0.3 subset
-                    // (uppercase `"OBJECT"`/`"STRING"` etc). Our tool
-                    // factories use lowercase JSON Schema for OpenAI
-                    // compatibility, so feed them through the mutually-
-                    // exclusive `parametersJsonSchema` field instead.
-                    cJSON_AddItemToObject(d, "parametersJsonSchema", params);
+            if (!config_.tools.empty()) {
+                cJSON* tool = cJSON_CreateObject();
+                cJSON* decls = cJSON_AddArrayToObject(tool, "functionDeclarations");
+                for (const auto& t : config_.tools) {
+                    cJSON* d = cJSON_CreateObject();
+                    cJSON_AddStringToObject(d, "name", t.name.c_str());
+                    cJSON_AddStringToObject(d, "description", t.description.c_str());
+                    cJSON* params = cJSON_Parse(t.parameters_json.c_str());
+                    if (params != nullptr) {
+                        // `parameters` expects Google's OpenAPI 3.0.3 subset
+                        // (uppercase `"OBJECT"`/`"STRING"` etc). Our tool
+                        // factories use lowercase JSON Schema for OpenAI
+                        // compatibility, so feed them through the mutually-
+                        // exclusive `parametersJsonSchema` field instead.
+                        cJSON_AddItemToObject(d, "parametersJsonSchema", params);
+                    }
+                    cJSON_AddItemToArray(decls, d);
                 }
-                cJSON_AddItemToArray(decls, d);
+                cJSON_AddItemToArray(tools, tool);
             }
-            cJSON_AddItemToArray(tools, tool);
+            // Google Search grounding: a separate tool object alongside the
+            // functionDeclarations one. The model decides when to search;
+            // results are used server-side and never round-trip to the device.
+            if (config_.enable_google_search) {
+                cJSON* gs_tool = cJSON_CreateObject();
+                cJSON_AddItemToObject(gs_tool, "googleSearch", cJSON_CreateObject());
+                cJSON_AddItemToArray(tools, gs_tool);
+            }
         }
 
         // Session resumption: if we have a handle from a prior goAway, ask
