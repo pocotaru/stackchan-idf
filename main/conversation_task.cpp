@@ -1238,7 +1238,14 @@ void conversation_task_entry(void* arg)
 
 void start_conversation_task(ConversationTaskArgs& args)
 {
-    xTaskCreatePinnedToCore(conversation_task_entry, "conversation", 8192, &args, 5, nullptr, 0);
+    // 20 KiB, not 8 KiB: the speak_katakoto tool runs the hts_engine HMM
+    // synthesis on this task, whose label-parse / DP-match locals overflow an
+    // 8 KiB stack ("stack overflow in task conversation" → panic reboot, so the
+    // device went unresponsive whenever the model used katakoto). The main task
+    // was already bumped to 16 KiB for the same hts_engine reason; this task's
+    // call chain into it (dispatch_tool → handle_speak_katakoto → synthesize)
+    // is deeper, so give it extra headroom.
+    xTaskCreatePinnedToCore(conversation_task_entry, "conversation", 20480, &args, 5, nullptr, 0);
 }
 
 } // namespace stackchan::app
