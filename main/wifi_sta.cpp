@@ -224,6 +224,12 @@ void wifi_start(const config::DeviceConfig& cfg)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Disable Wi-Fi modem power save. The default (WIFI_PS_MIN_MODEM) sleeps
+    // the radio between DTIM beacons, which adds tens-to-hundreds of ms of
+    // latency on the realtime Gemini audio uplink — the mic's 40 ms PCM chunks
+    // bunch up and arrive out of cadence ("音声が断続的 / 前後がずれる"). We're
+    // wall-powered, so keep the radio awake for a steady low-latency stream.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(kTag, "connecting to SSID: %s", cfg.wifi_ssid.c_str());
 }
 

@@ -164,16 +164,23 @@ std::optional<avatar::Expression> parse_emotion(const char* name)
     if (std::strcmp(name, "laughing") == 0 || std::strcmp(name, "funny") == 0 ||
         std::strcmp(name, "loving") == 0 || std::strcmp(name, "delicious") == 0 ||
         std::strcmp(name, "kissy") == 0 || std::strcmp(name, "winking") == 0 ||
-        std::strcmp(name, "silly") == 0) {
+        std::strcmp(name, "silly") == 0 || std::strcmp(name, "excited") == 0 ||
+        std::strcmp(name, "excitement") == 0 || std::strcmp(name, "joy") == 0 ||
+        std::strcmp(name, "joyful") == 0 || std::strcmp(name, "smile") == 0 ||
+        std::strcmp(name, "smiling") == 0 || std::strcmp(name, "cheerful") == 0) {
         return avatar::Expression::Happy;
     }
-    if (std::strcmp(name, "crying") == 0) {
+    if (std::strcmp(name, "crying") == 0 || std::strcmp(name, "disappointed") == 0 ||
+        std::strcmp(name, "lonely") == 0) {
         return avatar::Expression::Sad;
     }
-    if (std::strcmp(name, "shocked") == 0) {
+    if (std::strcmp(name, "shocked") == 0 || std::strcmp(name, "mad") == 0 ||
+        std::strcmp(name, "annoyed") == 0) {
         return avatar::Expression::Angry;
     }
-    if (std::strcmp(name, "surprised") == 0 || std::strcmp(name, "thinking") == 0 ||
+    if (std::strcmp(name, "surprised") == 0 || std::strcmp(name, "surprise") == 0 ||
+        std::strcmp(name, "amazed") == 0 || std::strcmp(name, "astonished") == 0 ||
+        std::strcmp(name, "thinking") == 0 || std::strcmp(name, "curious") == 0 ||
         std::strcmp(name, "confused") == 0 || std::strcmp(name, "embarrassed") == 0) {
         return avatar::Expression::Doubt;
     }
@@ -988,16 +995,17 @@ private:
         }
         const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, "expression");
         const char* name = cJSON_IsString(item) ? item->valuestring : nullptr;
-        const auto expr = parse_expression(name);
-        std::string result;
-        if (expr) {
+        // Be lenient: the model routinely sends affect words outside our
+        // 6-face vocabulary ("excitement", "surprise", "confused", ...). Map
+        // them the same way we map XiaoZhi's richer emotion set, and NEVER
+        // error — a tool error just makes the model apologise out loud every
+        // turn ("表情と首の向きが設定できない"). Unknown → leave the current
+        // face unchanged but still report success.
+        if (const auto expr = parse_emotion(name)) {
             state_.face.expression.store(static_cast<int>(*expr), std::memory_order_relaxed);
-            result = R"({"ok":true})";
-        } else {
-            result = R"({"ok":false,"error":"unknown expression"})";
         }
         cJSON_Delete(root);
-        return result;
+        return R"({"ok":true})";
     }
 
     // Synthesise the kana phrase through jtts and play it through the speaker.
@@ -1109,20 +1117,26 @@ private:
         if (root == nullptr) {
             return R"({"ok":false,"error":"bad arguments"})";
         }
+        // Accept both the schema keys (yaw_deg/pitch_deg) and the bare
+        // yaw/pitch the model frequently sends instead.
         const cJSON* yaw = cJSON_GetObjectItemCaseSensitive(root, "yaw_deg");
+        if (!cJSON_IsNumber(yaw)) yaw = cJSON_GetObjectItemCaseSensitive(root, "yaw");
         const cJSON* pitch = cJSON_GetObjectItemCaseSensitive(root, "pitch_deg");
-        std::string result;
-        if (cJSON_IsNumber(yaw) && cJSON_IsNumber(pitch)) {
-            const float yaw_deg = std::clamp(static_cast<float>(yaw->valuedouble), -40.0f, 40.0f);
-            const float pitch_deg = std::clamp(static_cast<float>(pitch->valuedouble), -10.0f, 25.0f);
-            state_.servo.target_yaw_deg.store(yaw_deg, std::memory_order_relaxed);
-            state_.servo.target_pitch_deg.store(pitch_deg, std::memory_order_relaxed);
-            result = R"({"ok":true})";
-        } else {
-            result = R"({"ok":false,"error":"yaw_deg and pitch_deg required"})";
+        if (!cJSON_IsNumber(pitch)) pitch = cJSON_GetObjectItemCaseSensitive(root, "pitch");
+        if (cJSON_IsNumber(yaw)) {
+            state_.servo.target_yaw_deg.store(
+                std::clamp(static_cast<float>(yaw->valuedouble), -40.0f, 40.0f),
+                std::memory_order_relaxed);
+        }
+        if (cJSON_IsNumber(pitch)) {
+            state_.servo.target_pitch_deg.store(
+                std::clamp(static_cast<float>(pitch->valuedouble), -10.0f, 25.0f),
+                std::memory_order_relaxed);
         }
         cJSON_Delete(root);
-        return result;
+        // Never error (a missing/partial pose shouldn't make the model
+        // apologise) — apply whichever axis we got, leave the other as-is.
+        return R"({"ok":true})";
     }
 
     // ---- members -----------------------------------------------------------
