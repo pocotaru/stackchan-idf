@@ -384,7 +384,11 @@ private:
             // "models/..."; the client prepends that for us when missing.
             // gemini-2.0-flash-live-001 was deprecated; the native-audio
             // preview is what's actually live on the Developer API right now.
-            cfg.model = "gemini-2.5-flash-native-audio-preview-12-2025";
+            // gemini-2.5-flash-native-audio-preview-12-2025 was rotated out and
+            // now closes the socket with code 1007 "audio content type not
+            // supported for this model configuration". gemini-3.1-flash-live-
+            // preview is its current native-audio replacement.
+            cfg.model = "gemini-3.1-flash-live-preview";
             cfg.voice = "Aoede"; // pre-built voice name; OK to leave empty
             // Let Gemini ground on Google Search for current info (weather,
             // news, today's date). Server-side; no device-side tool handler.
