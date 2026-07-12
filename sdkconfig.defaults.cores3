@@ -89,3 +89,15 @@ CONFIG_JTTS_ENABLE_HMM=y
 # hts_engine の合成 (ラベル パース等のスタック ローカル) が main タスクの
 # 既定 8 KB を溢れさせるため増量。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Bluetooth OFF (overrides the common sdkconfig.defaults BT_ENABLED=y for
+# cores3). The NimBLE controller + host held ~54 KiB of internal DRAM — far
+# more than the camera's ~10 KiB — and that starved the Gemini wss/TLS write
+# buffers, dropping the session into a "接続エラー" reconnect loop. With BT off
+# the internal heap sits at ~70-97 KiB free (largest block ~31 KiB), the camera
+# stays enabled, and the connection is rock solid. The BLE settings GATT
+# service is compiled out (see components/config_service/CMakeLists.txt →
+# config_service_stub.cpp); first-time Wi-Fi provisioning moves to the SoftAP
+# captive portal, ongoing config to the Wi-Fi HTTP settings page. Also removes
+# the always-on BLE advertising attack surface.
+CONFIG_BT_ENABLED=n
