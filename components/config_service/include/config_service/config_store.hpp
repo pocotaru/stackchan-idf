@@ -30,16 +30,12 @@ tl::expected<void, Error> save_mic_lip_gain(std::uint16_t input_pct,
 // Apply path so they take effect immediately and survive reboot.
 tl::expected<void, Error> save_speaker_volume(std::uint16_t pct);
 
-// Persist just the Gemini prebuilt voice name. Written immediately (no reboot)
-// so the next conversation session — which re-reads load().gemini_voice when it
-// connects — picks up the change. Single-writer, like save_speaker_volume,
-// but a string so it can't go through the numeric save_rows() helper.
-tl::expected<void, Error> save_gemini_voice(const std::string& voice);
-
 // Read just the Gemini voice name — one NVS key, no DeviceConfig. The
 // conversation task calls this on every connect(), so it must stay cheap: the
 // full load() reads ~36 keys (including multi-KiB strings) and would turn every
-// reconnect into a heavy allocation storm. Empty string → not set / default.
+// reconnect into a heavy allocation storm. The value only changes on Apply/
+// reboot (voice is a Staged setting), so per-connect reads just pick up the
+// last applied choice and survive reconnects. Empty string → not set / default.
 std::string load_gemini_voice();
 
 } // namespace stackchan::config::store

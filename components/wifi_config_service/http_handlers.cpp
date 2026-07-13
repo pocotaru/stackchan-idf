@@ -721,10 +721,9 @@ esp_err_t handle_gemini_voice_post(httpd_req_t* req)
     if (!require_auth(req)) return ESP_OK;
     std::string body;
     if (read_body_str(req, body, kMaxGeminiVoice) != ESP_OK) return ESP_OK;
-    // Persist immediately (no reboot): the next conversation session re-reads
-    // load().gemini_voice when it connects and picks up the change. Also mirror
-    // it into staging so the settings page and batch Apply stay consistent.
-    (void)config::store::save_gemini_voice(body);
+    // Stage only — the voice applies on the next Apply/reboot, like every other
+    // Staged setting. (The earlier "live switch without saving" path wrote NVS
+    // immediately; it was removed because switching mid-run didn't behave.)
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_staging.set_str("gemini-voice", std::move(body));
     xSemaphoreGive(g_mutex);
