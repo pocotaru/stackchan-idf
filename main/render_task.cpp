@@ -91,44 +91,6 @@ void draw_mute_badge(RichCanvas& canvas, int x, int y)
     canvas.end_group();
 }
 
-// Top-right "processing" indicator, composited into the same frame as the
-// face (like the battery gauge). Listening → an 8-dot ring with a bright
-// head that rotates (mic is streaming your voice up); Thinking → a single
-// dot blinking ~1.4 Hz (turn ended, waiting for the reply). Driven purely by
-// `now_ms` so it needs no per-frame state. `cx`/`cy` are the ring centre.
-void draw_thinking_hud(RichCanvas& canvas, HudPhase phase, std::uint32_t now_ms,
-                       std::int32_t canvas_w, bool circular)
-{
-    if (phase == HudPhase::None) return;
-    // 8 dot offsets on a ~9 px ring, from top, clockwise (no trig needed).
-    static constexpr std::int8_t kDx[8] = {0, 6, 9, 6, 0, -6, -9, -6};
-    static constexpr std::int8_t kDy[8] = {-9, -6, 0, 6, 9, 6, 0, -6};
-    const int inset = circular
-        ? static_cast<int>(canvas_w * (1.0f - 0.70710678f) * 0.5f) + 12
-        : 18;
-    const int cx = static_cast<int>(canvas_w) - inset;  // top-right
-    const int cy = inset;
-    const std::uint16_t head = canvas.color565(120, 200, 255);
-    const std::uint16_t t1 = canvas.color565(80, 140, 180);
-    const std::uint16_t t2 = canvas.color565(50, 90, 120);
-    const std::uint16_t dim = canvas.color565(30, 45, 60);
-
-    if (phase == HudPhase::Listening) {
-        const int h = static_cast<int>((now_ms / 90) % 8);  // head advances ~11/s
-        for (int i = 0; i < 8; ++i) {
-            const int behind = (h - i + 8) % 8;  // 0 = current head
-            const std::uint16_t c = behind == 0 ? head
-                                   : behind == 1 ? t1
-                                   : behind == 2 ? t2
-                                                 : dim;
-            canvas.fillCircle(cx + kDx[i], cy + kDy[i], 2, c);
-        }
-    } else {  // Thinking — blink one dot
-        const bool lit = (now_ms / 350) % 2 == 0;
-        canvas.fillCircle(cx, cy, 5, lit ? head : dim);
-    }
-}
-
 void render_task_entry(void* arg)
 {
     auto& args = *static_cast<RenderTaskArgs*>(arg);
@@ -295,12 +257,6 @@ void render_task_entry(void* arg)
                 : 6;
             draw_mute_badge(canvas, inset, inset + (gauge_shown ? 22 : 0));
         }
-
-        // Top-right conversation "processing" indicator (spinner while the
-        // mic streams up, blink while awaiting the reply). Live from the
-        // conversation task's Local state machine.
-        draw_thinking_hud(canvas, state->conv.hud.load(std::memory_order_relaxed),
-                          now_ms, canvas_w, args.circular_display);
 
         canvas.end_frame();
 
