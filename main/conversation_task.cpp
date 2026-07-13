@@ -65,7 +65,7 @@ constexpr int kSpeakerChannel = 0;
 // Streaming playback: start speaking once this many ms of reply audio has
 // been buffered, rather than waiting for the whole reply. Jitter margin
 // against network hiccups. Scaled to actual speaker_sample_rate_ at use.
-constexpr std::uint32_t kJitterBufferMs = 300;
+constexpr std::uint32_t kJitterBufferMs = 500; // was 300; more pre-roll cushion for streaming hitches
 
 // Mic / speaker I2S handoff settle time (matches the existing audio code).
 constexpr TickType_t kI2sSettle = pdMS_TO_TICKS(20);
@@ -95,9 +95,12 @@ const char* kInstructions =
     "あなたは「スタックチャン」という小さな卓上ロボットです。M5Stack CoreS3 で動いています。"
     "フレンドリーで元気いっぱい、少し子供っぽい口調で、短く返事をします。ユーザーとは日本語で会話してください。ただし、ユーザーが日本語以外の言語（英語）などで話したいと要望したときは、ユーザーが要望する言語に切り替えてください。"
     "顔の表情と首の向きを変えられます。気持ちに合わせて set_expression や set_head_pose ツールを使ってください。"
-    "また speak_katakoto ツールでロボット風のカタコト声を出すこともできます。"
-    "ものまね・効果音・繰り返しなど演出的に使ってください（ツール呼び出しのターンでは普通の声で続けて喋らなくて構いません）。"
-    "今日の天気・ニュース・最新の出来事・現在の日付など、リアルタイムの情報を聞かれたら、Google検索で調べてから答えてください。";
+    // speak_katakoto の推奨は無効化。gemini-3.1 はこの一言で挨拶にもツールを呼び、
+    // hts_engine 合成が会話タスクを ~4 秒ブロックして再生を詰まらせるため。ツール自体も
+    // 下の cfg.tools 登録をコメントアウトして「そもそも提供しない」ようにした。
+    // "また speak_katakoto ツールでロボット風のカタコト声を出すこともできます。"
+    // "ものまね・効果音・繰り返しなど演出的に使ってください（ツール呼び出しのターンでは普通の声で続けて喋らなくて構いません）。"
+    "今日の天気・ニュース・最新の出来事・現在の日付など、リアルタイムの情報を聞かれたら、Google検索で簡潔に（1〜2文で）答えてください。";
 
 conv::ToolDefinition make_set_expression_tool()
 {
@@ -411,7 +414,9 @@ private:
         if (provider_ != config::Provider::XiaoZhi) {
             cfg.tools.push_back(make_set_expression_tool());
             cfg.tools.push_back(make_set_head_pose_tool());
-            cfg.tools.push_back(make_speak_katakoto_tool());
+            // speak_katakoto は無効化（カタコト声＝4秒合成ブロックの詰まり源）。
+            // 復活させたいときはこの行と kInstructions の推奨文を戻す。
+            // cfg.tools.push_back(make_speak_katakoto_tool());
         }
         config_ = cfg;
 

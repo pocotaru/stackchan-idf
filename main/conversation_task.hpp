@@ -18,7 +18,11 @@ namespace stackchan::app {
 // (see app_main.cpp for rationale). conversation_task.cpp uses these same
 // constants when reading from the ring.
 constexpr std::size_t kConversationSegmentSamples = 4096;  // ~512 ms per segment at 8 kHz
-constexpr std::size_t kConversationSegmentBuffers = 3;
+// 4 (was 3): one extra internal-RAM ring slot (+8 KiB reserved at boot) gives
+// more slack when websocket_task saturates a core during long grounded replies
+// (task_wdt hitch), so the speaker doesn't underrun. M5.Speaker holds 2, we
+// keep 2 free.
+constexpr std::size_t kConversationSegmentBuffers = 4;
 
 struct ConversationTaskArgs {
     SharedState* state;
