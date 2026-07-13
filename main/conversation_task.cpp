@@ -545,16 +545,13 @@ private:
         }
         state_.conv.status.store(cs, std::memory_order_relaxed);
 
-        // Top-right processing HUD: blink while waiting for the reply
-        // (Thinking), clear once the reply arrives (Speaking) or when we drop
-        // back to idle listening. The spinner (Listening phase) is NOT driven
-        // from the Local state here — idle "Listening" means the mic is up but
-        // the user may be silent. It's raised on the SpeechStarted event (the
-        // server VAD detecting the user's utterance) so the spinner means
-        // "I'm hearing you", not just "connected".
+        // Top-right processing HUD: spinner while the mic streams up
+        // (Listening), blink while waiting for the reply (Thinking), clear
+        // once the reply arrives (Speaking) or we're otherwise not in a turn.
         HudPhase hud = HudPhase::None;
         switch (s) {
-        case Local::Thinking: hud = HudPhase::Thinking; break;
+        case Local::Listening: hud = HudPhase::Listening; break;
+        case Local::Thinking:  hud = HudPhase::Thinking; break;
         default: break;
         }
         state_.conv.hud.store(hud, std::memory_order_relaxed);
@@ -866,10 +863,6 @@ private:
 
         case conv::ConversationEventType::SpeechStarted:
             ESP_LOGI(kTag, "user speech started");
-            // Raise the spinner only while the user is actually speaking (server
-            // VAD onset), not for the whole idle-listening window. Cleared when
-            // speech stops → Thinking (blink) or the turn otherwise ends.
-            state_.conv.hud.store(HudPhase::Listening, std::memory_order_relaxed);
             break;
 
         case conv::ConversationEventType::SpeechStopped:
