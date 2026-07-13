@@ -751,6 +751,46 @@
       <label for="gemini-apikey">Gemini API キー</label>
       <input type="password" id="gemini-apikey" maxlength="256" placeholder="AIza… （変更しない場合は空欄）">
 
+      <label for="gemini-voice">Gemini 音声 (キャラ)</label>
+      <select id="gemini-voice">
+        <option value="">（既定: Aoede）</option>
+        <optgroup label="Female">
+          <option value="Aoede">Aoede — Female · Breezy</option>
+          <option value="Zephyr">Zephyr — Female · Bright</option>
+          <option value="Kore">Kore — Female · Firm</option>
+          <option value="Leda">Leda — Female · Youthful</option>
+          <option value="Callirrhoe">Callirrhoe — Female · Easy-going</option>
+          <option value="Autonoe">Autonoe — Female · Bright</option>
+          <option value="Despina">Despina — Female · Smooth</option>
+          <option value="Erinome">Erinome — Female · Clear</option>
+          <option value="Laomedeia">Laomedeia — Female · Upbeat</option>
+          <option value="Achernar">Achernar — Female · Soft</option>
+          <option value="Gacrux">Gacrux — Female · Mature</option>
+          <option value="Pulcherrima">Pulcherrima — Female · Forward</option>
+          <option value="Vindemiatrix">Vindemiatrix — Female · Gentle</option>
+          <option value="Sulafat">Sulafat — Female · Warm</option>
+        </optgroup>
+        <optgroup label="Male">
+          <option value="Puck">Puck — Male · Upbeat</option>
+          <option value="Charon">Charon — Male · Informative</option>
+          <option value="Fenrir">Fenrir — Male · Excitable</option>
+          <option value="Orus">Orus — Male · Firm</option>
+          <option value="Enceladus">Enceladus — Male · Breathy</option>
+          <option value="Iapetus">Iapetus — Male · Clear</option>
+          <option value="Umbriel">Umbriel — Male · Easy-going</option>
+          <option value="Algieba">Algieba — Male · Smooth</option>
+          <option value="Algenib">Algenib — Male · Gravelly</option>
+          <option value="Rasalgethi">Rasalgethi — Male · Informative</option>
+          <option value="Alnilam">Alnilam — Male · Firm</option>
+          <option value="Schedar">Schedar — Male · Even</option>
+          <option value="Achird">Achird — Male · Friendly</option>
+          <option value="Zubenelgenubi">Zubenelgenubi — Male · Casual</option>
+          <option value="Sadachbia">Sadachbia — Male · Lively</option>
+          <option value="Sadaltager">Sadaltager — Male · Knowledgeable</option>
+        </optgroup>
+      </select>
+      <p class="hint">Gemini Live の音声（キャラ）。空欄で既定(Aoede)。保存後の再起動で反映されます。※性別は目安、日本語での自然さは声により差があります。</p>
+
       <label for="xiaozhi-url">XiaoZhi サーバー URL</label>
       <input type="text" id="xiaozhi-url" maxlength="256" placeholder="ws://192.168.1.10:8000/xiaozhi/v1/">
 
@@ -1513,6 +1553,8 @@ async function refresh() {
     $('xiaozhi-url').value = s.xiaozhi_url || '';
     $('system-prompt').value = s.system_prompt || '';
     $('system-prompt').dataset.initial = s.system_prompt || '';
+    $('gemini-voice').value = s.gemini_voice || '';
+    $('gemini-voice').dataset.initial = s.gemini_voice || '';
     $('conv-headers').value = s.conv_extra_headers || '';
     $('conv-headers').dataset.initial = s.conv_extra_headers || '';
 
@@ -1637,6 +1679,10 @@ async function apply() {
     const sysPrompt = $('system-prompt').value;
     if (sysPrompt !== ($('system-prompt').dataset.initial ?? '')) {
       await postText('/api/system-prompt', sysPrompt);                        log('システムプロンプト送信', 'ok');
+    }
+    const gemVoice = $('gemini-voice').value;
+    if (gemVoice !== ($('gemini-voice').dataset.initial ?? '')) {
+      await postText('/api/gemini-voice', gemVoice);                          log('Gemini 音声送信', 'ok');
     }
     const convHeaders = $('conv-headers').value;
     if (convHeaders !== ($('conv-headers').dataset.initial ?? '')) {

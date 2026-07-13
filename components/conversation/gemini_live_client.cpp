@@ -587,7 +587,8 @@ private:
             (void)send_json(root);
         }
         cJSON_Delete(root);
-        ESP_LOGI(kTag, "setup sent (%u tools)", static_cast<unsigned>(config_.tools.size()));
+        ESP_LOGI(kTag, "setup sent (%u tools) voice='%s'",
+                 static_cast<unsigned>(config_.tools.size()), config_.voice.c_str());
         setup_sent_ = true;
     }
 

@@ -226,6 +226,41 @@ tl::expected<void, Error> save_mic_lip_gain(std::uint16_t input_pct,
                      "save_mic_lip_gain");
 }
 
+std::string load_gemini_voice()
+{
+    const SettingDescriptor* d = registry::find("gemini-voice");
+    if (!d) return {};
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(kNs, NVS_READONLY, &h);
+    if (err != ESP_OK) return {}; // not-found / uninit → default
+    std::string v = nvs_read_str(h, d->nvs_key);
+    nvs_close(h);
+    return v;
+}
+
+tl::expected<void, Error> save_gemini_voice(const std::string& voice)
+{
+    // A string row can't go through save_rows() (that helper only knows how to
+    // write numerics), so write the one key directly. Look the nvs_key up in the
+    // registry rather than hard-coding "gem_voice" so it stays in sync.
+    const SettingDescriptor* d = registry::find("gemini-voice");
+    if (!d) return tl::unexpected(Error::NvsWrite);
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(kNs, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "nvs_open(%s): %s", kNs, esp_err_to_name(err));
+        return tl::unexpected(Error::NvsWrite);
+    }
+    err = nvs_set_str(h, d->nvs_key, voice.c_str());
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "save_gemini_voice: %s", esp_err_to_name(err));
+        return tl::unexpected(Error::NvsWrite);
+    }
+    return {};
+}
+
 tl::expected<void, Error> save_speaker_volume(std::uint16_t pct)
 {
     if (pct > 200) pct = 200;

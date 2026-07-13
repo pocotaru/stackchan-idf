@@ -129,6 +129,10 @@ struct DeviceConfig {
     // (XiaoZhi's server owns its own persona, so it's ignored there). Empty →
     // the firmware's built-in default instructions. Settable over Wi-Fi.
     std::string system_prompt;
+    // Gemini Live prebuilt voice name (e.g. "Aoede", "Leda", "Kore"). Empty →
+    // the firmware default ("Aoede"). OpenAI / XiaoZhi ignore it. Settable over
+    // Wi-Fi. Capped at 32 bytes (voice names are short ASCII).
+    std::string gemini_voice;
     // Extra HTTP headers attached to the conversation API's WebSocket upgrade
     // (all providers), e.g. a Cloudflare Access service token in front of a
     // proxied endpoint. Newline-separated "Name: value" lines. Settable over Wi-Fi.

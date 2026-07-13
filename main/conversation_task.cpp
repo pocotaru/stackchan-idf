@@ -23,6 +23,7 @@
 
 #include "avatar/expression.hpp"
 #include "board/si12t_touch.hpp"
+#include "config_service/config_store.hpp"
 #include "conversation/gemini_live_client.hpp"
 #include "conversation/metrics.hpp"
 #include "conversation/openai_realtime_client.hpp"
@@ -389,7 +390,12 @@ private:
             // supported for this model configuration". gemini-3.1-flash-live-
             // preview is its current native-audio replacement.
             cfg.model = "gemini-3.1-flash-live-preview";
-            cfg.voice = "Aoede"; // pre-built voice name; OK to leave empty
+            // Prebuilt voice name from the Wi-Fi settings. Re-read from NVS on
+            // every connect so a change follows without a reboot — and so a
+            // reconnect mid-conversation keeps the chosen voice instead of
+            // reverting to the default. Empty → the default ("Aoede").
+            const std::string voice = config::store::load_gemini_voice();
+            cfg.voice = voice.empty() ? "Aoede" : voice;
             // Let Gemini ground on Google Search for current info (weather,
             // news, today's date). Server-side; no device-side tool handler.
             cfg.enable_google_search = true;

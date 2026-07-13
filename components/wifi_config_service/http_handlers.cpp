@@ -126,6 +126,7 @@ constexpr std::size_t kMaxPassword = 64;
 constexpr std::size_t kMaxApiKey = 256;
 constexpr std::size_t kMaxJttsConfig = 768;
 constexpr std::size_t kMaxSystemPrompt = 2048;
+constexpr std::size_t kMaxGeminiVoice = 32;
 constexpr std::size_t kMaxConvHeaders = 1024;
 constexpr std::size_t kMaxOtaChunk = 16384; // HTTP can chunk much bigger than BLE
 constexpr std::size_t kMaxBodyBytes = 32768;
@@ -386,6 +387,7 @@ esp_err_t handle_status_get(httpd_req_t* req)
     body += "\"servo_limits\":\"" + escape_json(cfg.servo_limits_json) + "\",";
     body += "\"lt_config\":\"" + escape_json(cfg.lt_config_json) + "\",";
     body += "\"system_prompt\":\"" + escape_json(cfg.system_prompt) + "\",";
+    body += "\"gemini_voice\":\"" + escape_json(cfg.gemini_voice) + "\",";
     body += "\"conv_extra_headers\":\"" + escape_json(cfg.conv_extra_headers) + "\",";
     body += "\"battery_mv\":" + std::to_string(bat_mv) + ",";
     body += "\"battery_ma\":" + std::to_string(bat_ma) + ",";
@@ -710,6 +712,21 @@ esp_err_t handle_system_prompt_post(httpd_req_t* req)
     if (read_body_str(req, body, kMaxSystemPrompt) != ESP_OK) return ESP_OK;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_staging.set_str("system-prompt", std::move(body));
+    xSemaphoreGive(g_mutex);
+    return send_empty(req);
+}
+
+esp_err_t handle_gemini_voice_post(httpd_req_t* req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    std::string body;
+    if (read_body_str(req, body, kMaxGeminiVoice) != ESP_OK) return ESP_OK;
+    // Persist immediately (no reboot): the next conversation session re-reads
+    // load().gemini_voice when it connects and picks up the change. Also mirror
+    // it into staging so the settings page and batch Apply stay consistent.
+    (void)config::store::save_gemini_voice(body);
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    g_staging.set_str("gemini-voice", std::move(body));
     xSemaphoreGive(g_mutex);
     return send_empty(req);
 }
@@ -1785,6 +1802,7 @@ void register_handlers(httpd_handle_t server, const config::DeviceConfig& curren
     add(server, "/api/servo-limits",    HTTP_POST, handle_servo_limits_post);
     add(server, "/api/servo-range-mode", HTTP_POST, handle_servo_range_mode_post);
     add(server, "/api/system-prompt",   HTTP_POST, handle_system_prompt_post);
+    add(server, "/api/gemini-voice",    HTTP_POST, handle_gemini_voice_post);
     add(server, "/api/conv-headers",     HTTP_POST, handle_conv_headers_post);
     add(server, "/api/settings",        HTTP_GET,  handle_settings_get);
     add(server, "/api/settings",        HTTP_POST, handle_settings_post);

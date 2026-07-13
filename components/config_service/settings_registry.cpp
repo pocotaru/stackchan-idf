@@ -51,6 +51,7 @@ const std::array<SettingDescriptor, kSettingCount> kTable = {{
     str_row("xiaozhi-token",  "xz_token",   ApplyKind::Staged, &DeviceConfig::xiaozhi_token, 256, true),
     str_row("jtts-config",    "jtts_cfg",   ApplyKind::Staged, &DeviceConfig::jtts_config_json, 960),
     str_row("system-prompt",  "sys_prompt", ApplyKind::Staged, &DeviceConfig::system_prompt, 2048),
+    str_row("gemini-voice",   "gem_voice",  ApplyKind::Staged, &DeviceConfig::gemini_voice, 32),
     str_row("conv-headers",   "conv_hdrs",  ApplyKind::Staged, &DeviceConfig::conv_extra_headers, 1024, true),
     str_row("face-config",    "face_cfg",   ApplyKind::Both,   &DeviceConfig::face_config_json, 768),
     str_row("servo-limits",   "srv_lim",    ApplyKind::Staged, &DeviceConfig::servo_limits_json, 768),
