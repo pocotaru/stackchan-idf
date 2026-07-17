@@ -82,6 +82,16 @@ void event_handler(void* /*arg*/, esp_event_base_t base, int32_t id, void* data)
         if (id == WIFI_EVENT_STA_START) {
             esp_wifi_connect();
         } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+            // Surface WHY we dropped. Common reasons: 201 NO_AP_FOUND (SSID not
+            // seen — usually a 5 GHz-only AP vs our 2.4 GHz radio, or wrong/hidden
+            // SSID), 15 4WAY_HANDSHAKE_TIMEOUT / 2 AUTH_EXPIRE (wrong password),
+            // 205 CONNECTION_FAIL, 200 BEACON_TIMEOUT (weak signal).
+            const auto* dis = static_cast<wifi_event_sta_disconnected_t*>(data);
+            if (dis != nullptr) {
+                ESP_LOGW(kTag, "STA disconnected: reason=%d rssi=%d ssid='%.*s'",
+                         dis->reason, dis->rssi, dis->ssid_len,
+                         reinterpret_cast<const char*>(dis->ssid));
+            }
             g_connected.store(false, std::memory_order_release);
             config::notify_wifi_connected(false);
             wifi_config::notify_wifi_connected(false);
@@ -96,9 +106,37 @@ void event_handler(void* /*arg*/, esp_event_base_t base, int32_t id, void* data)
                     esp_timer_start_once(g_sta_retry_timer, kApModeStaRetryUs);
                 }
             } else {
-                ESP_LOGW(kTag, "disconnected, retrying");
-                esp_wifi_connect();
+                // Diagnostic: every few NO_AP_FOUND failures, run a full scan
+                // and dump every visible AP (see WIFI_EVENT_SCAN_DONE) so we can
+                // tell whether the target SSID is even being advertised on
+                // 2.4 GHz and on which channel. Otherwise just retry.
+                static unsigned no_ap_fails = 0;
+                if (dis != nullptr && dis->reason == WIFI_REASON_NO_AP_FOUND &&
+                    (++no_ap_fails % 3 == 0)) {
+                    ESP_LOGW(kTag, "NO_AP_FOUND x%u — scanning visible APs", no_ap_fails);
+                    wifi_scan_config_t sc{}; // all channels, active scan
+                    if (esp_wifi_scan_start(&sc, false) != ESP_OK) {
+                        esp_wifi_connect();
+                    }
+                } else {
+                    ESP_LOGW(kTag, "disconnected, retrying");
+                    esp_wifi_connect();
+                }
             }
+        } else if (id == WIFI_EVENT_SCAN_DONE) {
+            uint16_t num = 0;
+            esp_wifi_scan_get_ap_num(&num);
+            ESP_LOGW(kTag, "scan: %u AP(s) visible on 2.4 GHz:", num);
+            static wifi_ap_record_t recs[16];
+            uint16_t got = 16;
+            if (esp_wifi_scan_get_ap_records(&got, recs) == ESP_OK) {
+                for (uint16_t i = 0; i < got; ++i) {
+                    ESP_LOGW(kTag, "  ch=%2d rssi=%4d auth=%d ssid='%s'",
+                             recs[i].primary, recs[i].rssi, recs[i].authmode,
+                             reinterpret_cast<const char*>(recs[i].ssid));
+                }
+            }
+            esp_wifi_connect(); // resume trying to associate
         } else if (id == WIFI_EVENT_AP_STACONNECTED) {
             // A provisioning client joined — give it quiet air: no STA
             // scans until every client leaves.
@@ -224,6 +262,13 @@ void wifi_start(const config::DeviceConfig& cfg)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Regulatory domain: force Japan. The IDF default "01" (world-safe) domain
+    // stops at channel 11, so an AP parked on ch 12–14 (legal/common in Japan)
+    // is invisible and unjoinable. ieee80211d_enabled=false → stay strictly JP
+    // (ch 1–14, JP tx-power limits) regardless of what the AP advertises.
+    if (esp_err_t e = esp_wifi_set_country_code("JP", false); e != ESP_OK) {
+        ESP_LOGW(kTag, "esp_wifi_set_country_code(JP) failed: %s", esp_err_to_name(e));
+    }
     // Disable Wi-Fi modem power save. The default (WIFI_PS_MIN_MODEM) sleeps
     // the radio between DTIM beacons, which adds tens-to-hundreds of ms of
     // latency on the realtime Gemini audio uplink — the mic's 40 ms PCM chunks
