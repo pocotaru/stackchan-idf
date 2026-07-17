@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <cJSON.h>
@@ -224,16 +225,25 @@ public:
         //   { "toolResponse":
         //     { "functionResponses":
         //       [ { "id": <id>, "name": <name>, "response": <object> } ] } }
-        // We don't have the function name here — the caller usually returns
-        // the result with the call_id alone, so leave name empty and let the
-        // server look up by id. Parse output_json into a cJSON object; if it
-        // isn't valid JSON, wrap it as {"output": "<string>"} so the server
-        // still gets something coherent.
+        // Gemini 3.1 requires BOTH id and name in each functionResponse. With
+        // name missing it silently does not accept the result → the turn never
+        // completes → the session wedges (looks like a silent no-response on the
+        // NEXT user turn). handle_tool_call recorded id→name; look it up here.
+        // Parse output_json into a cJSON object; if it isn't valid JSON, wrap it
+        // as {"output": "<string>"} so the server still gets something coherent.
         cJSON* root = cJSON_CreateObject();
         cJSON* tr = cJSON_AddObjectToObject(root, "toolResponse");
         cJSON* arr = cJSON_AddArrayToObject(tr, "functionResponses");
         cJSON* item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "id", std::string{call_id}.c_str());
+        {
+            std::lock_guard lock{tool_names_mutex_};
+            auto it = tool_call_names_.find(std::string{call_id});
+            if (it != tool_call_names_.end()) {
+                cJSON_AddStringToObject(item, "name", it->second.c_str());
+                tool_call_names_.erase(it);
+            }
+        }
 
         cJSON* parsed = cJSON_Parse(std::string{output_json}.c_str());
         if (parsed != nullptr && cJSON_IsObject(parsed)) {
@@ -831,6 +841,12 @@ private:
             const char* name = json_str(call, "name");
             const cJSON* args = cJSON_GetObjectItemCaseSensitive(call, "args");
             if (id == nullptr || name == nullptr) continue;
+            // Remember id→name so submit_tool_result can echo the name back
+            // (Gemini 3.1 requires it in the functionResponse).
+            {
+                std::lock_guard lock{tool_names_mutex_};
+                tool_call_names_[id] = name;
+            }
             char* args_str = (args != nullptr) ? cJSON_PrintUnformatted(args) : nullptr;
             ConversationEvent ev{};
             ev.type = ConversationEventType::ToolCallRequested;
@@ -973,6 +989,12 @@ private:
     esp_websocket_client_handle_t client_{nullptr};
     std::atomic<ConversationState> state_{ConversationState::Idle};
     std::mutex send_mutex_;
+
+    // call id → function name, recorded when a tool call arrives (rx task) and
+    // consumed when its result is sent (conv task). Its own mutex — the two
+    // run on different tasks and the send_mutex_ is held across the network I/O.
+    std::mutex tool_names_mutex_;
+    std::unordered_map<std::string, std::string> tool_call_names_;
 
     bool setup_sent_{false};
     bool turn_speech_stopped_emitted_{false};
