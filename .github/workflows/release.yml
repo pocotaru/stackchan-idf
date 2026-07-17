@@ -45,7 +45,7 @@ jobs:
       # artifacts though, so a partial success still won't publish.
       fail-fast: false
       matrix:
-        board: [cores3, atoms3r, atoms3, stopwatch]
+        board: [cores3]
     container:
       # Pinned to v5.5 to match local development. v6.0 dropped the built-in
       # `json` (cJSON) component in favour of an IDF component-manager
@@ -217,21 +217,13 @@ jobs:
         with:
           files: |
             firmware-${{ steps.version.outputs.version }}-cores3.zip
-            firmware-${{ steps.version.outputs.version }}-atoms3r.zip
-            firmware-${{ steps.version.outputs.version }}-atoms3.zip
-            firmware-${{ steps.version.outputs.version }}-stopwatch.zip
           body: |
             # Stack-chan Firmware ${{ steps.version.outputs.version }}
 
-            Stack-chan firmware (M5Stack CoreS3 / AtomS3R / AtomS3 / StopWatch 四方対応)。
+            Stack-chan firmware (M5Stack CoreS3 専用)。
 
             ## 対応ボード
             - **CoreS3 + M5/Takao ベース** (`firmware-${{ steps.version.outputs.version }}-cores3.zip`、16 MB flash / Quad PSRAM)
-            - **AtomS3R + Atomic ECHO BASE** "アトムニャン" (`firmware-${{ steps.version.outputs.version }}-atoms3r.zip`、8 MB flash / Octal PSRAM)
-            - **AtomS3 + Atomic ECHO BASE** slim プロファイル (`firmware-${{ steps.version.outputs.version }}-atoms3.zip`、8 MB flash / PSRAM なし)
-            - **M5 StopWatch (C152)** 円形 AMOLED 466×466 + ES8311 + BMI270 + RX8130CE + 振動モータ (`firmware-${{ steps.version.outputs.version }}-stopwatch.zip`、16 MB flash / Octal PSRAM)
-
-            PSRAM モードは bootloader レベルで確定するため、ボードごとに別 firmware です。
 
             ## Features
             - **OpenAI Realtime API / Google Gemini Live API** どちらかでリアルタイム音声会話
@@ -251,11 +243,11 @@ jobs:
             にアクセスして本リリースを選択し、ボードを選んでから書き込んでください。
 
             ### コマンドラインから初回書き込み
-            1. ボードに合った ZIP (`-cores3` / `-atoms3r` / `-atoms3` / `-stopwatch`) をダウンロード・展開
+            1. ZIP (`firmware-${{ steps.version.outputs.version }}-cores3.zip`) をダウンロード・展開
             2. esptool で書き込み:
                ```bash
                esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 460800 write_flash \
-                 0x0 firmware-${{ steps.version.outputs.version }}-<board>.bin
+                 0x0 firmware-${{ steps.version.outputs.version }}-cores3.bin
                ```
 
             ### BLE 経由の OTA(既に動いている場合)
